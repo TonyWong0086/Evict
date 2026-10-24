@@ -1,5 +1,6 @@
-use crate::programs::Hive;
+use crate::programs::{self, Hive};
 use std::{
+    collections::HashMap,
     env, fs, io,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -23,6 +24,8 @@ pub struct Entry {
     pub at: Where,
     approved: &'static str,
     pub enabled: bool,
+    /// Task Manager's rating; empty when the traces can't be read (needs admin)
+    pub impact: &'static str,
 }
 
 impl Entry {
@@ -67,6 +70,41 @@ fn approved(hive: Hive, sub: &str, name: &str) -> bool {
         .map_or(true, |v| v.bytes.first().map_or(true, |b| b & 1 == 0))
 }
 
+/// Worst sign-in cost per exe (lowercase path) as (CPU µs, disk bytes), from the traces Windows
+/// keeps for Task Manager. None without admin rights.
+fn traces() -> Option<HashMap<String, (u64, u64)>> {
+    let dir = PathBuf::from(env::var_os("SystemRoot")?).join(r"System32\wdi\LogFiles\StartupInfo");
+    let mut worst: HashMap<String, (u64, u64)> = HashMap::new();
+    for e in fs::read_dir(dir).ok()?.flatten() {
+        let Ok(b) = fs::read(e.path()) else { continue };
+        let xml = String::from_utf16_lossy(&b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
+        let tag = |p: &str, t: &str| p.split(&format!("<{t} ")).nth(1)?.split('>').nth(1)?.split('<').next()?.parse::<u64>().ok();
+        let mut sum: HashMap<String, (u64, u64)> = HashMap::new();
+        for p in xml.split("<Process Name=\"").skip(1) {
+            let Some(name) = p.split('"').next() else { continue };
+            let s = sum.entry(name.to_lowercase()).or_default();
+            s.0 += tag(p, "CpuUsage").unwrap_or(0);
+            s.1 += tag(p, "DiskUsage").unwrap_or(0);
+        }
+        for (k, (c, d)) in sum {
+            let w = worst.entry(k).or_default();
+            *w = (w.0.max(c), w.1.max(d));
+        }
+    }
+    Some(worst)
+}
+
+/// Task Manager's thresholds: High over 1 s CPU or 3 MB disk, Medium over 300 ms or 300 KB.
+fn rate(cpu_us: u64, disk: u64) -> &'static str {
+    if cpu_us > 1_000_000 || disk > 3 << 20 {
+        "High"
+    } else if cpu_us > 300_000 || disk > 300 << 10 {
+        "Medium"
+    } else {
+        "Low"
+    }
+}
+
 pub fn list() -> Vec<Entry> {
     let mut v = Vec::new();
     for (hive, key, ap) in [(Hive::CU, RUN, "Run"), (Hive::LM, RUN, "Run"), (Hive::LM, RUN32, "Run32")] {
@@ -79,6 +117,7 @@ pub fn list() -> Vec<Entry> {
                 hive,
                 at: Where::Reg(key),
                 approved: ap,
+                impact: "",
             });
         }
     }
@@ -97,8 +136,24 @@ pub fn list() -> Vec<Entry> {
                 hive,
                 at: Where::Folder(dir.clone()),
                 approved: "StartupFolder",
+                impact: "",
             });
         }
     }
+    if let Some(t) = traces() {
+        for e in &mut v {
+            // ponytail: shortcuts in the Startup folder aren't resolved to their target, so they stay unmeasured
+            let exe = programs::exe_path(&e.command).map(|p| p.display().to_string().to_lowercase());
+            e.impact = exe.and_then(|x| t.get(&x)).map_or("Not measured", |&(c, d)| rate(c, d));
+        }
+    }
     v
+}
+
+#[test]
+fn ratings() {
+    assert_eq!(rate(1_200_000, 0), "High");
+    assert_eq!(rate(0, 4 << 20), "High");
+    assert_eq!(rate(500_000, 0), "Medium");
+    assert_eq!(rate(100_000, 1000), "Low");
 }

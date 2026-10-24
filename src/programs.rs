@@ -102,6 +102,40 @@ impl Program {
         PathBuf::from(self.location.trim().trim_matches('"'))
     }
 
+    /// For when DisplayIcon is empty or stale (MSI installs, moved games): an exe in the install
+    /// folder, one named after the program, else the shallowest non-uninstaller.
+    pub fn icon_exe(&self, all: &[Program]) -> Option<String> {
+        let dir = self.install_dir(all, false)?;
+        let want: String = core_name(&self.name).chars().filter(|c| c.is_alphanumeric()).collect();
+        let (mut level, mut named, mut first) = (vec![dir], None, None);
+        // ponytail: 4 levels, 300 folders; deep enough for Epic's Launcher\Portal\Binaries\Win64
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for d in level.iter().take(300) {
+                for e in fs::read_dir(d).into_iter().flatten().flatten() {
+                    let (p, n) = (e.path(), e.file_name().to_string_lossy().to_lowercase());
+                    // "__Installer", "_CommonRedist" and setup / crash helpers aren't the program
+                    let helper = ["unins", "setup", "install", "cleanup", "crash", "redist"].iter().any(|h| n.contains(h));
+                    if p.is_dir() && !n.starts_with('_') {
+                        next.push(p);
+                    } else if n.ends_with(".exe") && !helper && named.is_none() {
+                        let stem: String = n[..n.len() - 4].chars().filter(|c| c.is_alphanumeric()).collect();
+                        if stem == want {
+                            named = Some(p);
+                        } else if first.is_none() {
+                            first = Some(p);
+                        }
+                    }
+                }
+            }
+            if named.is_some() {
+                break;
+            }
+            level = next;
+        }
+        named.or(first).map(|p| p.display().to_string())
+    }
+
     /// Where the program actually lives. `strict` sticks to what the registry (or Steam) states,
     /// which is what deletion uses; sizing also accepts folders inferred from the icon / uninstaller.
     pub fn install_dir(&self, all: &[Program], strict: bool) -> Option<PathBuf> {
@@ -164,7 +198,7 @@ pub fn folder_size(p: &Path, skip: &HashSet<String>) -> u64 {
 }
 
 /// The exe in `"C:\x\app.exe" --args` or `C:\x\app.exe,0`; launchers with URLs don't count.
-fn exe_path(cmd: &str) -> Option<PathBuf> {
+pub fn exe_path(cmd: &str) -> Option<PathBuf> {
     let s = cmd.trim();
     if s.contains("://") {
         return None;

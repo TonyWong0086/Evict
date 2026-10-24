@@ -168,12 +168,12 @@ pub struct Results {
 
 impl Results {
     /// Measures every item, so call it off the UI thread.
-    pub fn new(items: Vec<Item>, kept: Vec<Item>, ticked: bool, note: Option<String>, progs: Vec<Program>) -> Self {
+    pub fn new(items: Vec<Item>, kept: Vec<Item>, note: Option<String>, progs: Vec<Program>) -> Self {
         let found = items
             .into_iter()
             .map(|item| {
                 let (count, bytes) = measure(&item);
-                Found { item, count, bytes, on: ticked }
+                Found { item, count, bytes, on: true }
             })
             .collect();
         Results { found, kept, note, filter: String::new(), kids: HashMap::new(), progs }
@@ -356,7 +356,10 @@ fn node(ui: &mut egui::Ui, item: &Item, check: Option<&mut bool>, size: &str, ic
                 if let Some(t) = &icon {
                     ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(16.0, 16.0)));
                 }
-                let r = ui.add(egui::Label::new(&text).truncate().sense(Sense::click())).on_hover_text(&full);
+                let mut r = ui.add(egui::Label::new(&text).truncate().sense(Sense::click()));
+                if text != full {
+                    r = r.on_hover_text(&full);
+                }
                 item_menu(r, item);
             });
         });

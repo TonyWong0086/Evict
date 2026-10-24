@@ -331,12 +331,11 @@ impl App {
         if todo.is_empty() {
             return;
         }
-        let icons: Vec<(String, String)> =
-            todo.iter().filter(|p| !p.icon.trim().is_empty()).map(|p| (p.id(), p.icon.clone())).collect();
-        let (tx, c) = (self.tx.clone(), ctx.clone());
+        let (tx, c, all, icons) = (self.tx.clone(), ctx.clone(), self.programs.clone(), todo.clone());
         thread::spawn(move || {
-            for (id, path) in icons {
-                if let Some(img) = win::icon(&path) {
+            for p in icons {
+                if let Some(img) = win::icon(&p.icon).or_else(|| win::icon(&p.icon_exe(&all)?)) {
+                    let id = p.id();
                     let _ = tx.send(Msg::Icon(id, img));
                     c.request_repaint();
                 }
@@ -403,7 +402,7 @@ impl App {
             // Before the uninstaller deletes it: the deep scan looks for things still pointing into it.
             let dirs: Vec<_> = progs.iter().map(|p| p.install_dir(&all, true)).collect();
             let n = progs.len() as f32;
-            let mut items: Vec<Item> = Vec::new();
+            let (mut items, mut skipped): (Vec<Item>, Vec<&str>) = (Vec::new(), Vec::new());
             for (i, p) in progs.iter().enumerate() {
                 let at = i as f32 / n;
                 if run_uninstaller && !p.uninstall.is_empty() {
@@ -414,6 +413,12 @@ impl App {
                 }
                 if cancel.load(Ordering::Relaxed) {
                     return Msg::Cancelled;
+                }
+                // Its entry survived: that uninstaller was cancelled, so what's there is still in use.
+                if !force && Item::Key(p.hive, p.key.clone()).exists() {
+                    step(SCANNING, 1, format!("{} still looks installed, skipped.", p.name), at);
+                    skipped.push(&p.name);
+                    continue;
                 }
                 step(SCANNING, 1, format!("Scanning for {} leftovers…", p.name), at + 0.3 / n);
                 let traced = traces.iter().filter(|t| t.matches(p)).flat_map(|t| t.items.clone());
@@ -428,13 +433,12 @@ impl App {
             let folders: Vec<String> = items.iter().filter_map(|i| if let Item::Dir(d) = i { Some(programs::lower(d) + "\\") } else { None }).collect();
             items.retain(|i| !matches!(i, Item::File(f) if folders.iter().any(|d| programs::lower(f).starts_with(d))));
             step(SCANNING, 1, "Checking which files other programs still use…".into(), 0.85);
+            let note = (!skipped.is_empty()).then(|| format!("Still installed, so not scanned (uninstall cancelled?): {}.", skipped.join(", ")));
+            let progs: Vec<Program> = progs.iter().filter(|p| !skipped.contains(&p.name.as_str())).cloned().collect();
             let shared = programs::Shared::new(&all, &progs);
             let (kept, items): (Vec<Item>, Vec<Item>) = items.into_iter().partition(|i| shared.holds(i));
             step(SCANNING, 1, format!("Measuring {} items…", items.len()), 0.95);
-            // An uninstall entry that survived means the uninstaller was probably cancelled: don't pre-tick anything.
-            let survived = progs.iter().any(|p| Item::Key(p.hive, p.key.clone()).exists());
-            let note = (!force && survived).then(|| "The program still looks installed (uninstall cancelled?). Nothing is pre-ticked.".into());
-            let results = cleanup::Results::new(items, kept, force || !survived, note, progs);
+            let results = cleanup::Results::new(items, kept, note, progs);
             if cancel.load(Ordering::Relaxed) {
                 return Msg::Cancelled;
             }
@@ -444,7 +448,7 @@ impl App {
 
     /// Show `items` in the leftovers dialog; `progs` are logged to the history if removed.
     fn review(&mut self, ctx: &egui::Context, items: Vec<Item>, progs: Vec<Program>) {
-        self.job(ctx, move || Msg::Leftovers(cleanup::Results::new(items, Vec::new(), true, None, progs)));
+        self.job(ctx, move || Msg::Leftovers(cleanup::Results::new(items, Vec::new(), None, progs)));
     }
 
     /// Write the program list to the Desktop as CSV or JSON.
@@ -842,13 +846,13 @@ impl App {
             if ui.button("Refresh").clicked() {
                 self.startup = startup::list();
             }
-            ui.label(egui::RichText::new("Untick to stop a program from running at sign-in (the same switch Task Manager uses).").weak());
+            ui.label(egui::RichText::new("Untick to stop a program from running at sign-in (the same switch Task Manager uses). Impact needs admin rights.").weak());
         });
         if self.startup.is_empty() {
             return empty(ui, "Nothing runs at sign-in.");
         }
         let (mut del, mut err) = (None, None);
-        list_table(ui, &[44.0, 240.0, 460.0, 280.0]).header(28.0, |mut h| head(&mut h, &["On", "Name", "Command", "Location", ""])).body(|body| {
+        list_table(ui, &[44.0, 240.0, 90.0, 420.0, 260.0]).header(28.0, |mut h| head(&mut h, &["On", "Name", "Impact", "Command", "Location", ""])).body(|body| {
             body.rows(26.0, self.startup.len(), |mut row| {
                 let i = row.index();
                 let e = &mut self.startup[i];
@@ -861,8 +865,9 @@ impl App {
                     }
                 });
                 row.col(|ui| cell(ui, e.name.as_str()));
-                row.col(|ui| drop(ui.add(egui::Label::new(e.command.as_str()).truncate()).on_hover_text(&e.command)));
-                row.col(|ui| drop(ui.add(egui::Label::new(e.location()).truncate()).on_hover_text(e.location())));
+                row.col(|ui| cell(ui, e.impact));
+                row.col(|ui| drop(ui.add(egui::Label::new(e.command.as_str()).truncate())));
+                row.col(|ui| drop(ui.add(egui::Label::new(e.location()).truncate())));
                 row.col(|ui| {
                     if confirm_button(ui, &mut self.confirm, (Tab::Startup, i), "Delete") {
                         del = Some(i);
