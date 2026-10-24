@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-use winreg::{enums::*, RegKey};
+use winreg::{enums::*, types::FromRegValue, RegKey};
 
 pub const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 pub const UNINSTALL32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
@@ -43,6 +43,8 @@ pub enum Item {
     Dir(PathBuf),
     File(PathBuf),
     Key(Hive, String),
+    /// One value inside a key (a Run entry…): hive, key, value name
+    Value(Hive, String, String),
 }
 
 impl Item {
@@ -50,12 +52,14 @@ impl Item {
         match self {
             Item::Dir(p) | Item::File(p) => p.display().to_string(),
             Item::Key(h, k) => format!(r"{}\{k}", h.name()),
+            Item::Value(h, k, n) => format!(r"{}\{k}\{n}", h.name()),
         }
     }
     pub fn exists(&self) -> bool {
         match self {
             Item::Dir(p) | Item::File(p) => p.exists(),
             Item::Key(h, k) => h.root().open_subkey(k).is_ok(),
+            Item::Value(h, k, n) => h.root().open_subkey(k).and_then(|k| k.get_raw_value(n)).is_ok(),
         }
     }
     pub fn delete(&self) -> io::Result<()> {
@@ -63,7 +67,11 @@ impl Item {
             Item::Dir(p) => fs::remove_dir_all(p),
             Item::File(p) => fs::remove_file(p),
             Item::Key(h, k) => h.root().delete_subkey_all(k),
+            Item::Value(h, k, n) => h.root().open_subkey_with_flags(k, KEY_SET_VALUE)?.delete_value(n),
         }
+    }
+    pub fn is_registry(&self) -> bool {
+        matches!(self, Item::Key(..) | Item::Value(..))
     }
 }
 
@@ -82,6 +90,8 @@ pub struct Program {
     pub key: String,
     pub icon: String,
     pub is32: bool,
+    /// Entry left behind by a program that's already gone (see [`ghost`])
+    pub ghost: bool,
 }
 
 impl Program {
@@ -153,8 +163,8 @@ pub fn folder_size(p: &Path, skip: &HashSet<String>) -> u64 {
         .sum()
 }
 
-/// Folder of the exe in `"C:\x\app.exe" --args` or `C:\x\app.exe,0`; launchers with URLs don't count.
-fn exe_dir(cmd: &str) -> Option<PathBuf> {
+/// The exe in `"C:\x\app.exe" --args` or `C:\x\app.exe,0`; launchers with URLs don't count.
+fn exe_path(cmd: &str) -> Option<PathBuf> {
     let s = cmd.trim();
     if s.contains("://") {
         return None;
@@ -164,10 +174,41 @@ fn exe_dir(cmd: &str) -> Option<PathBuf> {
         None => &s[..s.to_lowercase().find(".exe")? + 4],
     };
     let path = Path::new(path);
-    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")).then(|| path.to_path_buf())
+}
+
+fn exe_dir(cmd: &str) -> Option<PathBuf> {
+    exe_path(cmd)?.parent().map(Path::to_path_buf)
+}
+
+/// A ghost entry: its uninstaller is gone (or Windows Installer no longer knows the MSI product)
+/// and so is its install folder, so the program can't be uninstalled; only the entry is left.
+fn ghost(uninstall: &str, location: &str) -> bool {
+    let loc = location.trim().trim_matches('"');
+    if !loc.is_empty() && Path::new(loc).exists() {
+        return false;
+    }
+    let u = uninstall.trim();
+    if u.to_lowercase().contains("msiexec") {
+        let guid = u.split_once('{').and_then(|(_, r)| r.split_once('}')).map(|(g, _)| g);
+        return guid.and_then(msi_packed).is_some_and(|p| {
+            let known = |h: Hive, k: &str| h.root().open_subkey(format!(r"{k}\{p}")).is_ok();
+            !known(Hive::LM, r"SOFTWARE\Classes\Installer\Products") && !known(Hive::CU, r"Software\Microsoft\Installer\Products")
+        });
+    }
+    // relative paths (rundll32.exe …) are found on PATH; can't tell
+    exe_path(u).is_some_and(|p| p.is_absolute() && !p.exists())
+}
+
+/// Windows Installer's "packed" product code: 90160000-008C-… → 00006109C800…
+pub fn msi_packed(guid: &str) -> Option<String> {
+    let h: Vec<char> = guid.chars().filter(|c| *c != '-').collect();
+    if h.len() != 32 || !h.iter().all(char::is_ascii_hexdigit) {
         return None;
     }
-    path.parent().map(Path::to_path_buf)
+    let rev = |a: usize, b: usize| h[a..b].iter().rev().collect::<String>();
+    let pairs: String = h[16..].chunks(2).flat_map(|p| [p[1], p[0]]).collect();
+    Some((rev(0, 8) + &rev(8, 12) + &rev(12, 16) + &pairs).to_uppercase())
 }
 
 /// Folders that are a layer inside an app, not the app: "version-4310…", "app-1.0.9", "Versions", "Application", "bin", "26.0".
@@ -273,6 +314,7 @@ pub fn list() -> Vec<Program> {
                     x86.is_some_and(|x| lower(Path::new(s("InstallLocation").trim().trim_matches('"'))).starts_with(&x))
                 }),
                 icon: s("DisplayIcon"),
+                ghost: ghost(&s("UninstallString"), &s("InstallLocation")),
             });
         }
     }
@@ -439,4 +481,121 @@ pub fn leftovers(p: &Program, all: &[Program]) -> Vec<Item> {
         }
     }
     out
+}
+
+/// The user's Desktop, wherever it's been redirected (OneDrive…).
+pub fn desktop() -> PathBuf {
+    let shell = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders";
+    Hive::CU.root().open_subkey(shell).and_then(|k| k.get_value::<String, _>("Desktop")).map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default()).join("Desktop")
+    })
+}
+
+/// `.lnk` files under `dir`, `depth` folders deep.
+fn shortcuts(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() && depth > 0 => v.extend(shortcuts(&p, depth - 1)),
+            Ok(t) if t.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) => v.push(p),
+            _ => {}
+        }
+    }
+    v
+}
+
+/// Does the shortcut's target path contain `needle` (lowercase)? Shell links store it as ANSI and/or UTF-16.
+fn lnk_points(lnk: &Path, needle: &str) -> bool {
+    let Ok(mut bytes) = fs::read(lnk) else { return false };
+    bytes.make_ascii_lowercase();
+    let wide: Vec<u8> = needle.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    [needle.as_bytes(), &wide].iter().any(|n| bytes.windows(n.len()).any(|w| w == *n))
+}
+
+/// Deep scan: what uninstallers commonly leave pointing at the old install folder (shortcuts, Run
+/// entries, App Paths, services), plus shortcuts and temp folders named after the program.
+/// `dir` is the install folder as it was *before* uninstalling.
+pub fn references(p: &Program, dir: Option<&Path>) -> Vec<Item> {
+    let (name, publ) = (core_name(&p.name), core_name(&p.publisher));
+    let named = |s: &str| matchable(&name, &publ) && core_name(s) == name;
+    let dir = dir.map(|d| lower(d) + "\\");
+    let points = |s: &str| dir.as_ref().is_some_and(|d| s.to_lowercase().contains(d.as_str()));
+    let e = |k: &str| env::var_os(k).map(PathBuf::from);
+    let mut v = Vec::new();
+
+    let mut places: Vec<PathBuf> = ["APPDATA", "ProgramData"].into_iter().filter_map(e).map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs")).collect();
+    places.extend(e("PUBLIC").map(|p| p.join("Desktop")));
+    places.push(desktop());
+    for f in places.iter().flat_map(|d| shortcuts(d, 2)) {
+        let stem = f.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        if named(&stem) || dir.as_ref().is_some_and(|d| lnk_points(&f, d)) {
+            v.push(Item::File(f));
+        }
+    }
+    if let Some(t) = e("TEMP") {
+        v.extend(subdirs(&t).filter(|(c, _)| matchable(&name, &publ) && *c == name).map(|(_, d)| Item::Dir(d)));
+    }
+    if dir.is_none() {
+        return v;
+    }
+    for hive in [Hive::LM, Hive::CU] {
+        for key in [r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"] {
+            let Ok(k) = hive.root().open_subkey(key) else { continue };
+            v.extend(k.enum_values().flatten().filter(|(_, val)| points(&val.to_string())).map(|(n, _)| Item::Value(hive, key.into(), n)));
+        }
+        let app_paths = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+        let Ok(k) = hive.root().open_subkey(app_paths) else { continue };
+        for sub in k.enum_keys().flatten() {
+            if k.open_subkey(&sub).and_then(|s| s.get_value::<String, _>("")).is_ok_and(|t| points(&t)) {
+                v.push(Item::Key(hive, format!(r"{app_paths}\{sub}")));
+            }
+        }
+    }
+    let services = r"SYSTEM\CurrentControlSet\Services";
+    if let Ok(k) = Hive::LM.root().open_subkey(services) {
+        for sub in k.enum_keys().flatten() {
+            if k.open_subkey(&sub).and_then(|s| s.get_value::<String, _>("ImagePath")).is_ok_and(|t| points(&t)) {
+                v.push(Item::Key(Hive::LM, format!(r"{services}\{sub}")));
+            }
+        }
+    }
+    v
+}
+
+/// Shared file protection: leftovers other software still needs are held back. That's a folder
+/// holding (or inside) another program's install folder, or holding a file SharedDLLs says
+/// more than one program uses.
+pub struct Shared {
+    dirs: Vec<String>,
+    dlls: Vec<String>,
+}
+
+impl Shared {
+    pub fn new(all: &[Program], removing: &[Program]) -> Self {
+        let dirs = all
+            .iter()
+            .filter(|o| !removing.iter().any(|r| r.key == o.key) && Item::Key(o.hive, o.key.clone()).exists())
+            .filter_map(|o| o.install_dir(all, true))
+            .map(|d| lower(&d))
+            .collect();
+        let mut dlls = Vec::new();
+        for key in [r"SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\SharedDLLs"] {
+            let Ok(k) = Hive::LM.root().open_subkey(key) else { continue };
+            // ponytail: refcount >= 2 means "someone else too"; uninstallers that forget to decrement leave false positives
+            for (file, val) in k.enum_values().flatten() {
+                if u32::from_reg_value(&val).is_ok_and(|n| n >= 2) && Path::new(&file).exists() {
+                    dlls.push(lower(Path::new(&file)));
+                }
+            }
+        }
+        Shared { dirs, dlls }
+    }
+
+    pub fn holds(&self, i: &Item) -> bool {
+        let (Item::Dir(p) | Item::File(p)) = i else { return false };
+        let l = lower(p);
+        let within = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}\\"));
+        self.dirs.iter().any(|d| within(d, &l) || within(&l, d)) || self.dlls.iter().any(|f| within(f, &l))
+    }
 }

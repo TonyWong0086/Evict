@@ -11,13 +11,18 @@ Evict does what Geek Uninstaller does, plus the features Geek keeps behind its p
 | | |
 |---|---|
 | **Program list** | Every installed desktop program with its icon, version, publisher, real size, install date and folder. Sort by any column, search as you type, Ctrl+click to select several. |
-| **Clean uninstall** | Runs the program's own uninstaller, **waits for it and every process it spawns to finish**, then scans for leftover files, folders and registry keys. You review a File System / Registry tree and tick what goes. |
+| **Clean uninstall** | Runs the program's own uninstaller, **waits for it and every process it spawns to finish**, then scans for leftover files, folders and registry keys. You review a File System / Registry tree, with sizes, and tick what goes. |
+| **Deep leftover scan** | Also finds what still points at the old install folder: Start Menu and Desktop shortcuts, Run entries, App Paths and services, plus temp folders named after the program. |
+| **Shared file protection** | Leftovers another installed program still uses (a shared vendor folder, a DLL with a SharedDLLs count of 2+) are shown as *Kept* and never offered for removal. |
+| **Ghost entries** | Finds programs that are already gone but still listed (their uninstaller and folder no longer exist) and removes the stale entries in one go. |
 | **Force removal** | For programs whose uninstaller is broken or missing: skip it and go straight to the leftover scan. |
 | **Real sizes** | Sizes are measured on disk, mods and caches included, not taken from what the installer reported. See [How sizes work](#how-sizes-work). |
 | **Install monitor** | Snapshots the registry and watches the disk while an installer runs, then saves everything it added as a *trace*. Uninstalling a traced program removes exactly what was installed. *(Pro in Geek)* |
 | **Startup manager** | Turn programs that run at sign-in on or off (the same switch Task Manager uses), or delete the entry. *(Pro in Geek)* |
-| **Store apps** | List and remove Microsoft Store apps. |
-| **Right-click menu** | Uninstall, Force Removal, Remove Entry, Modify, Installation Folder, Registry Entry, Program Website, Google for. |
+| **Bloatware remover** | The Store apps tab marks preinstalled apps most people never use (Bing News, Solitaire, Clipchamp, Candy Crush…). Select them in one click, review, and remove. |
+| **Uninstall history** | Every removal is logged with its date, how many items went and how much space was freed. |
+| **Export** | Save the program list, with real sizes and folders, as CSV (opens in Excel) or JSON. |
+| **Right-click menu** | Right-click anywhere in a row: Uninstall, Force Removal, Remove Entry, Modify, Installation Folder, Registry Entry, Program Website, Google for. |
 
 ## Safety
 
@@ -59,8 +64,9 @@ cargo test -- --ignored --nocapture   # read-only check against this machine
 | File | What's in it |
 |---|---|
 | `src/main.rs` | Window, tabs, program table, right-click menu |
-| `src/programs.rs` | Reading installed programs, install folders, sizes, leftover matching |
+| `src/programs.rs` | Reading installed programs, install folders, sizes, leftover matching, deep scan, ghosts, shared file protection |
 | `src/cleanup.rs` | Uninstall progress and leftovers dialogs |
+| `src/history.rs` | Uninstall history |
 | `src/monitor.rs` | Installation monitor and traces |
 | `src/startup.rs` | Startup entries |
 | `src/win.rs` | Win32 glue: icons, opening links, drives, waiting on uninstallers |

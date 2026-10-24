@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 eframe = "0.29"
 egui_extras = "0.29"
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation", "Win32_Security"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Foundation", "Win32_Security"] }
 winreg = "0.52"
 notify = "6"
 serde = { version = "1", features = ["derive"] }

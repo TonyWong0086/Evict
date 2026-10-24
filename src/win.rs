@@ -2,6 +2,7 @@
 use eframe::egui::ColorImage;
 use std::{
     io,
+    os::windows::process::CommandExt,
     mem::zeroed,
     ptr::{null, null_mut},
     sync::atomic::{AtomicBool, Ordering},
@@ -10,6 +11,7 @@ use windows_sys::Win32::{
     Foundation::CloseHandle,
     Graphics::Gdi::*,
     System::{
+        SystemInformation::GetLocalTime,
         JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation, QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION},
         Threading::{CreateProcessW, ResumeThread, Sleep, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW},
     },
@@ -72,6 +74,21 @@ pub fn run_and_wait(cmdline: &str, cancel: &AtomicBool) -> io::Result<()> {
         CloseHandle(job);
         Ok(())
     }
+}
+
+/// Local time as "2026-10-24 14:03".
+pub fn now() -> String {
+    let t = unsafe {
+        let mut t = zeroed();
+        GetLocalTime(&mut t);
+        t
+    };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
+}
+
+/// Open Explorer with `path` selected.
+pub fn reveal(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
 }
 
 /// Open a URL in the default browser or a folder in Explorer.

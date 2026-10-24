@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod cleanup;
+mod history;
 mod monitor;
 mod programs;
 mod startup;
@@ -22,12 +23,12 @@ const NO_WINDOW: u32 = 0x0800_0000;
 
 enum Msg {
     Store(Vec<StoreApp>),
-    /// found items with their item counts, pre-ticked?, note
-    Leftovers(Vec<(Item, usize)>, bool, Option<String>),
+    Leftovers(cleanup::Results),
     Cancelled,
     Monitor(Result<monitor::Session, String>),
     Trace(monitor::Trace),
-    Deleted(String),
+    /// status line, history entry to log
+    Deleted(String, Option<history::Entry>),
     // background fill-ins, not jobs
     Icon(String, egui::ColorImage),
     /// id, bytes on disk, resolved install folder
@@ -62,13 +63,28 @@ enum Tab {
     Store,
     Startup,
     Monitor,
+    History,
 }
 
 struct StoreApp {
     name: String,
     full: String,
     version: String,
+    bloat: bool,
 }
+
+/// Preinstalled Store apps most people never use; prefix match on the package name.
+const BLOAT: &[&str] = &[
+    "Microsoft.BingNews", "Microsoft.BingWeather", "Microsoft.BingFinance", "Microsoft.BingSports", "Microsoft.BingSearch",
+    "Microsoft.GetHelp", "Microsoft.Getstarted", "Microsoft.MicrosoftSolitaireCollection", "Microsoft.People",
+    "Microsoft.WindowsFeedbackHub", "Microsoft.ZuneMusic", "Microsoft.ZuneVideo", "Microsoft.MicrosoftOfficeHub",
+    "Microsoft.SkypeApp", "Microsoft.MixedReality.Portal", "Microsoft.WindowsMaps", "Microsoft.3DBuilder",
+    "Microsoft.Microsoft3DViewer", "Microsoft.Print3D", "Microsoft.Messaging", "Microsoft.OneConnect",
+    "Microsoft.PowerAutomateDesktop", "Microsoft.Todos", "Microsoft.549981C3F5F10", "Microsoft.WindowsCommunicationsApps",
+    "Microsoft.MicrosoftJournal", "Microsoft.Wallet", "MicrosoftTeams", "Clipchamp.Clipchamp", "MicrosoftCorporationII.MicrosoftFamily",
+    "king.com.", "Disney.", "SpotifyAB.SpotifyMusic", "Facebook.", "AmazonVideo.PrimeVideo", "BytedancePte.Ltd.TikTok",
+    "4DF9E0F8.Netflix", "5A894077.McAfeeSecurity",
+];
 
 struct App {
     tab: Tab,
@@ -83,6 +99,9 @@ struct App {
     loading: HashSet<String>,
     store: Vec<StoreApp>,
     store_loaded: bool,
+    store_sel: HashSet<String>,
+    ghosts_only: bool,
+    history: Vec<history::Entry>,
     startup: Vec<startup::Entry>,
     traces: Vec<monitor::Trace>,
     task: Option<cleanup::Task>,
@@ -109,7 +128,7 @@ fn powershell(script: &str) -> String {
         .unwrap_or_default()
 }
 
-fn regedit(path: &str) {
+pub(crate) fn regedit(path: &str) {
     let applet = r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit";
     if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(applet) {
         let _ = k.set_value("LastKey", &format!(r"Computer\{path}"));
@@ -123,15 +142,21 @@ fn store_list() -> Vec<StoreApp> {
         .lines()
         .filter_map(|l| {
             let mut s = l.split('\t');
-            Some(StoreApp { name: s.next()?.into(), full: s.next()?.into(), version: s.next()?.trim().into() })
+            let name: String = s.next()?.into();
+            let bloat = BLOAT.iter().any(|b| name.starts_with(b));
+            Some(StoreApp { name, full: s.next()?.into(), version: s.next()?.trim().into(), bloat })
         })
         .collect();
     v.sort_by_key(|a| a.name.to_lowercase());
     v
 }
 
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// Three significant digits like Geek: "106 GB", "72.8 GB", "8.66 GB".
-fn fmt_bytes(b: u64) -> String {
+pub(crate) fn fmt_bytes(b: u64) -> String {
     if b == 0 {
         return String::new();
     }
@@ -150,6 +175,10 @@ fn fmt_bytes(b: u64) -> String {
     }
 }
 
+fn bytes_or_zero(b: u64) -> String {
+    if b == 0 { "0 B".into() } else { fmt_bytes(b) }
+}
+
 fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -160,7 +189,7 @@ fn url_encode(s: &str) -> String {
         .collect()
 }
 
-/// Geek's Action menu; rendered both as the right-click menu and as the toolbar.
+/// Geek's Action menu, shown on right-click anywhere in a row.
 fn actions(ui: &mut egui::Ui, first: Option<&Program>, count: usize, act: &mut Option<Act>) {
     let one = first.filter(|_| count == 1);
     let has = |f: fn(&Program) -> &String| one.is_some_and(|p| !f(p).trim().is_empty());
@@ -184,10 +213,6 @@ fn actions(ui: &mut egui::Ui, first: Option<&Program>, count: usize, act: &mut O
 /// Version, Publisher, Size and Installed On are centered, like Geek.
 fn centered(col: usize) -> bool {
     (1..=4).contains(&col)
-}
-
-fn with_counts(items: Vec<Item>) -> Vec<(Item, usize)> {
-    items.into_iter().map(|i| (cleanup::count(&i), i)).map(|(c, i)| (i, c)).collect()
 }
 
 /// Non-selectable label, so clicks fall through to the table row.
@@ -237,6 +262,9 @@ impl App {
             loading: HashSet::new(),
             store: Vec::new(),
             store_loaded: false,
+            store_sel: HashSet::new(),
+            ghosts_only: false,
+            history: history::load(),
             startup: startup::list(),
             traces: monitor::load_all(),
             task: None,
@@ -319,52 +347,109 @@ impl App {
         const SCANNING: &str = "Scanning for leftover files, folders and registry items...";
         let traces = self.traces.clone();
         let all = self.programs.clone();
-        let task = cleanup::Task::new(SCANNING);
+        let names = progs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+        let task = cleanup::Task::new(SCANNING, names);
         let (state, cancel) = (task.state.clone(), task.cancel.clone());
         self.task = Some(task);
         self.job(ctx, move || {
-            let step = |title: &str, line: String, frac: f32| {
+            let step = |title: &str, stage: usize, line: String, frac: f32| {
                 let mut s = state.lock().unwrap();
                 s.title = title.into();
+                s.stage = stage;
                 s.log.push(line);
                 s.frac = frac;
             };
+            // Before the uninstaller deletes it: the deep scan looks for things still pointing into it.
+            let dirs: Vec<_> = progs.iter().map(|p| p.install_dir(&all, true)).collect();
             let n = progs.len() as f32;
-            let mut items = Vec::new();
+            let mut items: Vec<Item> = Vec::new();
             for (i, p) in progs.iter().enumerate() {
                 let at = i as f32 / n;
                 if run_uninstaller && !p.uninstall.is_empty() {
-                    step("Waiting for the uninstaller to finish...", format!("Running the {} uninstaller…", p.name), at);
+                    step("Waiting for the uninstaller to finish...", 0, format!("Running the {} uninstaller…", p.name), at);
                     if let Err(e) = win::run_and_wait(&format!("cmd /S /C \"{}\"", p.uninstall), &cancel) {
-                        step(SCANNING, format!("Couldn't start it: {e}"), at);
+                        step(SCANNING, 1, format!("Couldn't start it: {e}"), at);
                     }
                 }
                 if cancel.load(Ordering::Relaxed) {
                     return Msg::Cancelled;
                 }
-                step(SCANNING, format!("Scanning for {} leftovers…", p.name), at + 0.3 / n);
+                step(SCANNING, 1, format!("Scanning for {} leftovers…", p.name), at + 0.3 / n);
                 let traced = traces.iter().filter(|t| t.matches(p)).flat_map(|t| t.items.clone());
-                for i in programs::leftovers(p, &all).into_iter().chain(traced) {
+                let deep = programs::references(p, dirs[i].as_deref());
+                for i in programs::leftovers(p, &all).into_iter().chain(deep).chain(traced) {
                     if i.exists() && !items.contains(&i) {
                         items.push(i);
                     }
                 }
             }
-            step(SCANNING, format!("Counting {} items…", items.len()), 0.95);
-            let found = with_counts(items);
-            if cancel.load(Ordering::Relaxed) {
-                return Msg::Cancelled;
-            }
+            // A shortcut inside a Start Menu folder that's already listed goes with the folder.
+            let folders: Vec<String> = items.iter().filter_map(|i| if let Item::Dir(d) = i { Some(programs::lower(d) + "\\") } else { None }).collect();
+            items.retain(|i| !matches!(i, Item::File(f) if folders.iter().any(|d| programs::lower(f).starts_with(d))));
+            step(SCANNING, 1, "Checking which files other programs still use…".into(), 0.85);
+            let shared = programs::Shared::new(&all, &progs);
+            let (kept, items): (Vec<Item>, Vec<Item>) = items.into_iter().partition(|i| shared.holds(i));
+            step(SCANNING, 1, format!("Measuring {} items…", items.len()), 0.95);
             // An uninstall entry that survived means the uninstaller was probably cancelled: don't pre-tick anything.
             let survived = progs.iter().any(|p| Item::Key(p.hive, p.key.clone()).exists());
             let note = (!force && survived).then(|| "The program still looks installed (uninstall cancelled?). Nothing is pre-ticked.".into());
-            Msg::Leftovers(found, force || !survived, note)
+            let results = cleanup::Results::new(items, kept, force || !survived, note, progs);
+            if cancel.load(Ordering::Relaxed) {
+                return Msg::Cancelled;
+            }
+            Msg::Leftovers(results)
         });
     }
 
-    /// Show `items` in the leftovers dialog (item counts are worked out in the background).
-    fn review(&mut self, ctx: &egui::Context, items: Vec<Item>) {
-        self.job(ctx, move || Msg::Leftovers(with_counts(items), true, None));
+    /// Show `items` in the leftovers dialog; `progs` are logged to the history if removed.
+    fn review(&mut self, ctx: &egui::Context, items: Vec<Item>, progs: Vec<Program>) {
+        self.job(ctx, move || Msg::Leftovers(cleanup::Results::new(items, Vec::new(), true, None, progs)));
+    }
+
+    /// Write the program list to the Desktop as CSV or JSON.
+    fn export(&self, json: bool) -> std::io::Result<std::path::PathBuf> {
+        #[derive(serde::Serialize)]
+        struct Row<'a> {
+            name: &'a str,
+            version: &'a str,
+            publisher: &'a str,
+            size_bytes: u64,
+            installed_on: &'a str,
+            folder: String,
+            is_32bit: bool,
+            ghost: bool,
+            uninstall: &'a str,
+        }
+        let rows: Vec<Row> = self
+            .programs
+            .iter()
+            .map(|p| Row {
+                name: &p.name,
+                version: &p.version,
+                publisher: &p.publisher,
+                size_bytes: self.size_of(p),
+                installed_on: &p.date,
+                folder: self.folder_of(p),
+                is_32bit: p.is32,
+                ghost: p.ghost,
+                uninstall: &p.uninstall,
+            })
+            .collect();
+        let data = if json {
+            serde_json::to_string_pretty(&rows)?
+        } else {
+            // BOM so Excel reads it as UTF-8
+            let mut s = String::from("\u{feff}Name,Version,Publisher,Size (bytes),Installed On,Folder,32-bit,Ghost,Uninstall\r\n");
+            for r in &rows {
+                let f = [r.name, r.version, r.publisher].map(csv_field).join(",");
+                let g = [r.installed_on, &r.folder].map(csv_field).join(",");
+                s += &format!("{f},{},{g},{},{},{}\r\n", r.size_bytes, r.is_32bit, r.ghost, csv_field(r.uninstall));
+            }
+            s
+        };
+        let path = programs::desktop().join(format!("Evict programs {}.{}", &win::now()[..10], if json { "json" } else { "csv" }));
+        std::fs::write(&path, data)?;
+        Ok(path)
     }
 
     fn selected(&self) -> Vec<Program> {
@@ -377,7 +462,7 @@ impl App {
         match act {
             Act::Uninstall => self.scan(ctx, sel, false, true),
             Act::Force => self.scan(ctx, sel, true, false),
-            Act::RemoveEntry => self.review(ctx, sel.into_iter().map(|p| Item::Key(p.hive, p.key)).collect()),
+            Act::RemoveEntry => self.review(ctx, sel.iter().map(|p| Item::Key(p.hive, p.key.clone())).collect(), sel),
             Act::Modify => drop(thread::spawn(move || shell(&p.modify))),
             Act::Folder => win::open(&self.folder_of(&p)),
             Act::Registry => regedit(&format!(r"{}\{}", p.hive.name(), p.key)),
@@ -389,21 +474,48 @@ impl App {
     fn programs_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let mut act = None;
-        let selected = self.selected();
-        ui.horizontal_wrapped(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Type to find a program").desired_width(200.0));
-            if ui.button("Refresh").clicked() {
+        let ghosts: Vec<Program> = self.programs.iter().filter(|p| p.ghost).cloned().collect();
+        let mut export = None;
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("🔎 Type to find a program").desired_width(240.0));
+            if ui.button("⟳ Refresh").clicked() {
                 self.reload(&ctx);
             }
-            ui.separator();
-            actions(ui, selected.first(), selected.len(), &mut act);
+            ui.menu_button("⤓ Export", |ui| {
+                if ui.button("CSV (Excel)").clicked() {
+                    export = Some(false);
+                    ui.close_menu();
+                }
+                if ui.button("JSON").clicked() {
+                    export = Some(true);
+                    ui.close_menu();
+                }
+            });
+            if !ghosts.is_empty() || self.ghosts_only {
+                ui.separator();
+                ui.toggle_value(&mut self.ghosts_only, format!("👻 Ghosts ({})", ghosts.len()))
+                    .on_hover_text("Entries whose program is already gone: the uninstaller and install folder no longer exist.");
+                if self.ghosts_only && ui.add_enabled(!ghosts.is_empty(), egui::Button::new("Remove all ghost entries")).clicked() {
+                    self.review(&ctx, ghosts.iter().map(|p| Item::Key(p.hive, p.key.clone())).collect(), ghosts.clone());
+                }
+            }
         });
+        if let Some(json) = export {
+            self.status = match self.export(json) {
+                Ok(path) => {
+                    win::reveal(&path);
+                    format!("Exported {} programs to {}", self.programs.len(), path.display())
+                }
+                Err(e) => format!("Export failed: {e}"),
+            };
+        }
         ui.separator();
 
         let f = self.filter.to_lowercase();
         let mut rows: Vec<&Program> = self
             .programs
             .iter()
+            .filter(|p| !self.ghosts_only || p.ghost)
             .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f) || p.publisher.to_lowercase().contains(&f))
             .collect();
         let (col, asc) = self.sort;
@@ -473,25 +585,30 @@ impl App {
                     let p = rows[row.index()];
                     let id = p.id();
                     row.set_selected(self.sel.contains(&id));
-                    row.col(|ui| {
-                        match self.icons.get(&id) {
-                            Some(t) => drop(ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(18.0, 18.0)))),
-                            None => ui.add_space(22.0),
-                        }
-                        cell(ui, p.name.as_str());
-                        if p.is32 {
-                            cell(ui, egui::RichText::new("(32-bit)").weak());
-                        }
-                        if self.traces.iter().any(|t| t.matches(p)) {
-                            cell(ui, egui::RichText::new("[traced]").weak());
-                        }
-                    });
+                    let mut cells = vec![row
+                        .col(|ui| {
+                            match self.icons.get(&id) {
+                                Some(t) => drop(ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(18.0, 18.0)))),
+                                None => ui.add_space(22.0),
+                            }
+                            cell(ui, p.name.as_str());
+                            if p.ghost {
+                                cell(ui, egui::RichText::new("(ghost)").color(egui::Color32::from_rgb(240, 180, 60)));
+                            }
+                            if p.is32 {
+                                cell(ui, egui::RichText::new("(32-bit)").weak());
+                            }
+                            if self.traces.iter().any(|t| t.matches(p)) {
+                                cell(ui, egui::RichText::new("[traced]").weak());
+                            }
+                        })
+                        .1];
                     let mid = |ui: &mut egui::Ui, t: String| drop(ui.centered_and_justified(|ui| cell(ui, t)));
-                    row.col(|ui| mid(ui, p.version.clone()));
-                    row.col(|ui| mid(ui, p.publisher.clone()));
-                    row.col(|ui| mid(ui, fmt_bytes(self.size_of(p))));
-                    row.col(|ui| mid(ui, programs::pretty_date(&p.date)));
-                    row.col(|ui| cell(ui, self.folder_of(p)));
+                    cells.push(row.col(|ui| mid(ui, p.version.clone())).1);
+                    cells.push(row.col(|ui| mid(ui, p.publisher.clone())).1);
+                    cells.push(row.col(|ui| mid(ui, fmt_bytes(self.size_of(p)))).1);
+                    cells.push(row.col(|ui| mid(ui, programs::pretty_date(&p.date))).1);
+                    cells.push(row.col(|ui| cell(ui, self.folder_of(p))).1);
 
                     let r = row.response();
                     if r.clicked() || r.double_clicked() {
@@ -504,7 +621,10 @@ impl App {
                         click = Some((id.clone(), false));
                     }
                     let n = if self.sel.contains(&id) { count } else { 1 };
-                    r.context_menu(|ui| actions(ui, Some(p), n, &mut act));
+                    // The row's combined response keeps only the first cell's id, so the menu goes on every cell.
+                    for c in cells {
+                        c.context_menu(|ui| actions(ui, Some(p), n, &mut act));
+                    }
                 });
             });
 
@@ -530,35 +650,57 @@ impl App {
 
     fn store_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let bloat = self.store.iter().filter(|a| a.bloat).count();
+        let mut remove = false;
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Search").desired_width(180.0));
-            if ui.button("Refresh").clicked() {
+            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("🔎 Search").desired_width(200.0));
+            if ui.button("⟳ Refresh").clicked() {
                 self.store_loaded = false;
             }
-            ui.label(format!("{} apps", self.store.len()));
+            ui.separator();
+            if ui.add_enabled(bloat > 0, egui::Button::new(format!("Select bloatware ({bloat})"))).on_hover_text("Tick the preinstalled apps most people never use").clicked() {
+                self.store_sel = self.store.iter().filter(|a| a.bloat).map(|a| a.full.clone()).collect();
+            }
+            if ui.add_enabled(!self.store_sel.is_empty(), egui::Button::new("Clear")).clicked() {
+                self.store_sel.clear();
+            }
+            let n = self.store_sel.len();
+            ui.add_enabled_ui(n > 0, |ui| remove = confirm_button(ui, &mut self.confirm, (Tab::Store, 0), &format!("Remove {n} selected")));
+            ui.label(egui::RichText::new(format!("{} apps", self.store.len())).weak());
         });
         ui.separator();
         let f = self.filter.to_lowercase();
-        let mut remove = None;
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("store").striped(true).num_columns(3).show(ui, |ui| {
-                for (i, a) in self.store.iter().enumerate() {
+            egui::Grid::new("store").striped(true).num_columns(4).spacing([16.0, 6.0]).show(ui, |ui| {
+                for h in ["", "Name", "Version", ""] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for a in &self.store {
                     if !f.is_empty() && !a.name.to_lowercase().contains(&f) {
                         continue;
                     }
+                    let mut on = self.store_sel.contains(&a.full);
+                    if ui.checkbox(&mut on, "").changed() {
+                        if on { self.store_sel.insert(a.full.clone()) } else { self.store_sel.remove(&a.full) };
+                    }
                     ui.label(&a.name);
                     ui.label(&a.version);
-                    if confirm_button(ui, &mut self.confirm, (Tab::Store, i), "Uninstall") {
-                        remove = Some(a.full.clone());
+                    if a.bloat {
+                        ui.label(egui::RichText::new("bloatware").color(egui::Color32::from_rgb(240, 180, 60)).small());
+                    } else {
+                        ui.label("");
                     }
                     ui.end_row();
                 }
             });
         });
-        if let Some(full) = remove {
-            self.status = format!("Removing {full}…");
+        if remove {
+            let full: Vec<String> = self.store_sel.drain().collect();
+            self.status = format!("Removing {} app(s)…", full.len());
             self.job(&ctx, move || {
-                powershell(&format!("Remove-AppxPackage -Package '{}'", full.replace('\'', "''")));
+                let list = full.iter().map(|f| format!("'{}'", f.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+                powershell(&format!("{list} | ForEach-Object {{ Remove-AppxPackage -Package $_ }}"));
                 Msg::Store(store_list())
             });
         }
@@ -662,7 +804,7 @@ impl App {
         });
         if let Some(i) = clean {
             let items = self.traces[i].items.iter().filter(|x| x.exists()).cloned().collect();
-            self.review(&ctx, items);
+            self.review(&ctx, items, Vec::new());
         }
         if let Some(i) = del {
             let _ = self.traces.remove(i).remove();
@@ -679,19 +821,78 @@ impl App {
         let Some(results) = &mut self.leftovers else { return };
         match results.ui(ctx) {
             Some(cleanup::Outcome::Finish(items)) => {
-                self.leftovers = None;
-                if !items.is_empty() {
-                    self.job(ctx, move || {
-                        let errs: Vec<String> = items.iter().filter_map(|i| i.delete().err().map(|e| format!("{}: {e}", i.label()))).collect();
-                        Msg::Deleted(match errs.first() {
-                            None => format!("Removed {} item(s).", items.len()),
-                            Some(e) => format!("{} of {} failed, e.g. {e}", errs.len(), items.len()),
-                        })
+                let progs = self.leftovers.take().unwrap().progs;
+                self.status = format!("Removing {} item(s)…", items.len());
+                self.job(ctx, move || {
+                    let (mut errs, mut bytes) = (Vec::new(), 0);
+                    for (i, b) in &items {
+                        match i.delete() {
+                            Ok(()) => bytes += b,
+                            Err(e) => errs.push(format!("{}: {e}", i.label())),
+                        }
+                    }
+                    let done = items.len() - errs.len();
+                    let entry = (!progs.is_empty()).then(|| {
+                        let join = |f: fn(&Program) -> &str| progs.iter().map(f).collect::<Vec<_>>().join(", ");
+                        history::Entry {
+                            when: win::now(),
+                            name: join(|p| &p.name),
+                            version: join(|p| &p.version),
+                            publisher: join(|p| &p.publisher),
+                            items: done,
+                            bytes,
+                        }
                     });
-                }
+                    let status = match errs.first() {
+                        None => format!("Removed {done} item(s), {} freed.", bytes_or_zero(bytes)),
+                        Some(e) => format!("{} of {} failed, e.g. {e}", errs.len(), items.len()),
+                    };
+                    Msg::Deleted(status, entry)
+                });
             }
             Some(cleanup::Outcome::Cancel) => self.leftovers = None,
             None => {}
+        }
+    }
+
+    fn history_ui(&mut self, ui: &mut egui::Ui) {
+        let (freed, items) = self.history.iter().fold((0, 0), |(b, n), e| (b + e.bytes, n + e.items));
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{} uninstalls · {items} items removed · {} freed", self.history.len(), bytes_or_zero(freed))).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(!self.history.is_empty(), |ui| clear = confirm_button(ui, &mut self.confirm, (Tab::History, 0), "Clear history"));
+            });
+        });
+        ui.separator();
+        if self.history.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| ui.label(egui::RichText::new("Programs you uninstall with Evict are listed here.").weak()));
+        }
+        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+            egui::Grid::new("history").striped(true).num_columns(6).spacing([20.0, 6.0]).show(ui, |ui| {
+                if !self.history.is_empty() {
+                    for h in ["When", "Program", "Version", "Publisher", "Items removed", "Freed"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                }
+                for e in self.history.iter().rev() {
+                    ui.label(&e.when);
+                    ui.label(&e.name);
+                    ui.label(&e.version);
+                    ui.label(&e.publisher);
+                    ui.label(e.items.to_string());
+                    ui.label(fmt_bytes(e.bytes));
+                    ui.end_row();
+                }
+            });
+        });
+        if clear {
+            self.history.clear();
+            if let Err(e) = history::save(&self.history) {
+                self.status = format!("Couldn't save history: {e}");
+            }
         }
     }
 }
@@ -719,10 +920,10 @@ impl eframe::App for App {
                     self.store = s;
                     self.status.clear();
                 }
-                Msg::Leftovers(found, ticked, note) => {
+                Msg::Leftovers(results) => {
                     self.task = None;
                     self.status.clear();
-                    self.leftovers = Some(cleanup::Results::new(found, ticked, note));
+                    self.leftovers = Some(results);
                     self.reload(ctx);
                 }
                 Msg::Cancelled => {
@@ -743,8 +944,14 @@ impl eframe::App for App {
                     self.traces.push(t);
                     self.reload(ctx);
                 }
-                Msg::Deleted(s) => {
+                Msg::Deleted(s, entry) => {
                     self.status = s;
+                    if let Some(e) = entry {
+                        self.history.push(e);
+                        if let Err(e) = history::save(&self.history) {
+                            self.status = format!("Couldn't save history: {e}");
+                        }
+                    }
                     self.reload(ctx);
                 }
             }
@@ -765,7 +972,7 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for (t, l) in [(Tab::Programs, "Programs"), (Tab::Store, "Store apps"), (Tab::Startup, "Startup"), (Tab::Monitor, "Install monitor")] {
+                for (t, l) in [(Tab::Programs, "Programs"), (Tab::Store, "Store apps"), (Tab::Startup, "Startup"), (Tab::Monitor, "Install monitor"), (Tab::History, "History")] {
                     if ui.selectable_label(self.tab == t, l).clicked() {
                         self.tab = t;
                         self.confirm = None;
@@ -785,11 +992,19 @@ impl eframe::App for App {
             });
         });
         self.dialogs(ctx);
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+        let modal = self.task.is_some() || self.leftovers.is_some();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // dims and locks the list while a dialog is up
+            if modal {
+                ui.disable();
+            }
+            match self.tab {
             Tab::Programs => self.programs_ui(ui),
             Tab::Store => self.store_ui(ui),
             Tab::Startup => self.startup_ui(ui),
             Tab::Monitor => self.monitor_ui(ui),
+            Tab::History => self.history_ui(ui),
+            }
         });
     }
 }
@@ -819,6 +1034,8 @@ mod tests {
         assert_eq!(iso_date("6/27/2026").as_deref(), Some("2026-06-27"));
         assert_eq!(iso_date("20250114").as_deref(), Some("2025-01-14"));
         assert_eq!(pretty_date("2025-09-29"), "Sep 29, 2025");
+        assert_eq!(super::programs::msi_packed("90160000-008C-0000-0000-0000000FF1CE").as_deref(), Some("00006109C80000000000000000F01FEC"));
+        assert_eq!(super::programs::msi_packed("nope"), None);
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(
             topmost(s(&[r"C:\A\b", r"C:\A\b c", r"C:\a\B\c.txt", r"C:\X\y"])),
@@ -846,6 +1063,14 @@ mod tests {
         }
         for p in progs.iter().take(400).filter(|p| !p.location.is_empty()).take(5) {
             println!("{} -> {:?}", p.name, super::programs::leftovers(p, &progs).iter().map(|i| i.label()).collect::<Vec<_>>());
+        }
+        for p in progs.iter().filter(|p| p.ghost) {
+            println!("ghost: {} | {}", p.name, p.uninstall);
+        }
+        let shared = super::programs::Shared::new(&progs, &[]);
+        for p in progs.iter().take(400).filter(|p| !p.location.is_empty()).take(8) {
+            let refs = super::programs::references(p, p.install_dir(&progs, true).as_deref());
+            println!("deep {} -> {:?}", p.name, refs.iter().map(|i| (i.label(), shared.holds(i))).collect::<Vec<_>>());
         }
         let t = std::time::Instant::now();
         let s = super::monitor::start(String::new()).unwrap();
