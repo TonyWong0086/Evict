@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod cleanup;
 mod monitor;
 mod programs;
 mod startup;
@@ -11,7 +12,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     os::windows::process::CommandExt,
     process::{Command, ExitStatus},
-    sync::{mpsc, Arc, Mutex},
+    sync::{atomic::Ordering, mpsc, Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -21,7 +22,9 @@ const NO_WINDOW: u32 = 0x0800_0000;
 
 enum Msg {
     Store(Vec<StoreApp>),
-    Leftovers(Vec<Item>, bool),
+    /// found items with their item counts, pre-ticked?, note
+    Leftovers(Vec<(Item, usize)>, bool, Option<String>),
+    Cancelled,
     Monitor(Result<monitor::Session, String>),
     Trace(monitor::Trace),
     Deleted(String),
@@ -82,8 +85,8 @@ struct App {
     store_loaded: bool,
     startup: Vec<startup::Entry>,
     traces: Vec<monitor::Trace>,
-    leftovers: Option<Vec<(Item, bool)>>,
-    rescan: Option<(Vec<Program>, bool)>,
+    task: Option<cleanup::Task>,
+    leftovers: Option<cleanup::Results>,
     confirm: Option<(Tab, usize)>,
     monitor: Option<monitor::Session>,
     installer: String,
@@ -183,6 +186,10 @@ fn centered(col: usize) -> bool {
     (1..=4).contains(&col)
 }
 
+fn with_counts(items: Vec<Item>) -> Vec<(Item, usize)> {
+    items.into_iter().map(|i| (cleanup::count(&i), i)).map(|(c, i)| (i, c)).collect()
+}
+
 /// Non-selectable label, so clicks fall through to the table row.
 fn cell(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).selectable(false).truncate());
@@ -232,8 +239,8 @@ impl App {
             store_loaded: false,
             startup: startup::list(),
             traces: monitor::load_all(),
+            task: None,
             leftovers: None,
-            rescan: None,
             confirm: None,
             monitor: None,
             installer: String::new(),
@@ -307,17 +314,35 @@ impl App {
         });
     }
 
+    /// Run each uninstaller to completion (if asked), then scan for what it left behind.
     fn scan(&mut self, ctx: &egui::Context, progs: Vec<Program>, force: bool, run_uninstaller: bool) {
+        const SCANNING: &str = "Scanning for leftover files, folders and registry items...";
         let traces = self.traces.clone();
         let all = self.programs.clone();
-        self.status = format!("{} {} program(s)…", if run_uninstaller { "Uninstalling" } else { "Scanning" }, progs.len());
-        self.rescan = Some((progs.clone(), force));
+        let task = cleanup::Task::new(SCANNING);
+        let (state, cancel) = (task.state.clone(), task.cancel.clone());
+        self.task = Some(task);
         self.job(ctx, move || {
+            let step = |title: &str, line: String, frac: f32| {
+                let mut s = state.lock().unwrap();
+                s.title = title.into();
+                s.log.push(line);
+                s.frac = frac;
+            };
+            let n = progs.len() as f32;
             let mut items = Vec::new();
-            for p in &progs {
+            for (i, p) in progs.iter().enumerate() {
+                let at = i as f32 / n;
                 if run_uninstaller && !p.uninstall.is_empty() {
-                    let _ = shell(&p.uninstall);
+                    step("Waiting for the uninstaller to finish...", format!("Running the {} uninstaller…", p.name), at);
+                    if let Err(e) = win::run_and_wait(&format!("cmd /S /C \"{}\"", p.uninstall), &cancel) {
+                        step(SCANNING, format!("Couldn't start it: {e}"), at);
+                    }
                 }
+                if cancel.load(Ordering::Relaxed) {
+                    return Msg::Cancelled;
+                }
+                step(SCANNING, format!("Scanning for {} leftovers…", p.name), at + 0.3 / n);
                 let traced = traces.iter().filter(|t| t.matches(p)).flat_map(|t| t.items.clone());
                 for i in programs::leftovers(p, &all).into_iter().chain(traced) {
                     if i.exists() && !items.contains(&i) {
@@ -325,10 +350,21 @@ impl App {
                     }
                 }
             }
-            // If an uninstall entry survived, the uninstaller was probably cancelled: don't pre-tick anything.
+            step(SCANNING, format!("Counting {} items…", items.len()), 0.95);
+            let found = with_counts(items);
+            if cancel.load(Ordering::Relaxed) {
+                return Msg::Cancelled;
+            }
+            // An uninstall entry that survived means the uninstaller was probably cancelled: don't pre-tick anything.
             let survived = progs.iter().any(|p| Item::Key(p.hive, p.key.clone()).exists());
-            Msg::Leftovers(items, force || !survived)
+            let note = (!force && survived).then(|| "The program still looks installed (uninstall cancelled?). Nothing is pre-ticked.".into());
+            Msg::Leftovers(found, force || !survived, note)
         });
+    }
+
+    /// Show `items` in the leftovers dialog (item counts are worked out in the background).
+    fn review(&mut self, ctx: &egui::Context, items: Vec<Item>) {
+        self.job(ctx, move || Msg::Leftovers(with_counts(items), true, None));
     }
 
     fn selected(&self) -> Vec<Program> {
@@ -341,10 +377,7 @@ impl App {
         match act {
             Act::Uninstall => self.scan(ctx, sel, false, true),
             Act::Force => self.scan(ctx, sel, true, false),
-            Act::RemoveEntry => {
-                self.rescan = None;
-                self.leftovers = Some(sel.into_iter().map(|p| (Item::Key(p.hive, p.key), true)).collect());
-            }
+            Act::RemoveEntry => self.review(ctx, sel.into_iter().map(|p| Item::Key(p.hive, p.key)).collect()),
             Act::Modify => drop(thread::spawn(move || shell(&p.modify))),
             Act::Folder => win::open(&self.folder_of(&p)),
             Act::Registry => regedit(&format!(r"{}\{}", p.hive.name(), p.key)),
@@ -628,59 +661,37 @@ impl App {
             });
         });
         if let Some(i) = clean {
-            self.rescan = None;
-            self.leftovers = Some(self.traces[i].items.iter().filter(|x| x.exists()).map(|x| (x.clone(), true)).collect());
+            let items = self.traces[i].items.iter().filter(|x| x.exists()).cloned().collect();
+            self.review(&ctx, items);
         }
         if let Some(i) = del {
             let _ = self.traces.remove(i).remove();
         }
     }
 
-    fn leftovers_window(&mut self, ctx: &egui::Context) {
-        let Some(list) = &mut self.leftovers else { return };
-        let (mut open, mut delete, mut rescan) = (true, false, false);
-        egui::Window::new("Leftovers").open(&mut open).default_size([760.0, 420.0]).show(ctx, |ui| {
-            if list.is_empty() {
-                ui.label("Nothing left behind.");
-            } else {
-                ui.label("Review before deleting. Ticked items are removed permanently.");
-                ui.horizontal(|ui| {
-                    if ui.button("Tick all").clicked() {
-                        list.iter_mut().for_each(|x| x.1 = true);
-                    }
-                    if ui.button("Untick all").clicked() {
-                        list.iter_mut().for_each(|x| x.1 = false);
-                    }
-                });
-                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for (it, on) in list.iter_mut() {
-                        ui.checkbox(on, it.label());
-                    }
-                });
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(t) = &self.task {
+            if t.ui(ctx) {
+                t.cancel.store(true, Ordering::Relaxed);
             }
-            ui.horizontal(|ui| {
-                delete = ui.add_enabled(list.iter().any(|x| x.1), egui::Button::new("Delete ticked")).clicked();
-                if self.rescan.is_some() {
-                    rescan = ui.button("Rescan").on_hover_text("Uninstaller still running? Finish it, then rescan.").clicked();
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        let Some(results) = &mut self.leftovers else { return };
+        match results.ui(ctx) {
+            Some(cleanup::Outcome::Finish(items)) => {
+                self.leftovers = None;
+                if !items.is_empty() {
+                    self.job(ctx, move || {
+                        let errs: Vec<String> = items.iter().filter_map(|i| i.delete().err().map(|e| format!("{}: {e}", i.label()))).collect();
+                        Msg::Deleted(match errs.first() {
+                            None => format!("Removed {} item(s).", items.len()),
+                            Some(e) => format!("{} of {} failed, e.g. {e}", errs.len(), items.len()),
+                        })
+                    });
                 }
-            });
-        });
-        if delete {
-            let items: Vec<Item> = list.iter().filter(|x| x.1).map(|x| x.0.clone()).collect();
-            self.leftovers = None;
-            self.job(ctx, move || {
-                let errs: Vec<String> = items.iter().filter_map(|i| i.delete().err().map(|e| format!("{}: {e}", i.label()))).collect();
-                Msg::Deleted(match errs.first() {
-                    None => format!("Removed {} item(s).", items.len()),
-                    Some(e) => format!("{} of {} failed, e.g. {e}", errs.len(), items.len()),
-                })
-            });
-        } else if rescan {
-            let (progs, force) = self.rescan.clone().unwrap();
-            self.leftovers = None;
-            self.scan(ctx, progs, force, false);
-        } else if !open {
-            self.leftovers = None;
+            }
+            Some(cleanup::Outcome::Cancel) => self.leftovers = None,
+            None => {}
         }
     }
 }
@@ -708,9 +719,15 @@ impl eframe::App for App {
                     self.store = s;
                     self.status.clear();
                 }
-                Msg::Leftovers(items, checked) => {
-                    self.status = if checked { format!("Found {} leftover(s).", items.len()) } else { "The program still looks installed — nothing pre-ticked.".into() };
-                    self.leftovers = Some(items.into_iter().map(|i| (i, checked)).collect());
+                Msg::Leftovers(found, ticked, note) => {
+                    self.task = None;
+                    self.status.clear();
+                    self.leftovers = Some(cleanup::Results::new(found, ticked, note));
+                    self.reload(ctx);
+                }
+                Msg::Cancelled => {
+                    self.task = None;
+                    self.status = "Cancelled.".into();
                 }
                 Msg::Monitor(Ok(s)) => {
                     self.monitor = Some(s);
@@ -767,7 +784,7 @@ impl eframe::App for App {
                 ui.label(&self.status);
             });
         });
-        self.leftovers_window(ctx);
+        self.dialogs(ctx);
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Programs => self.programs_ui(ui),
             Tab::Store => self.store_ui(ui),
@@ -807,6 +824,15 @@ mod tests {
             topmost(s(&[r"C:\A\b", r"C:\A\b c", r"C:\a\B\c.txt", r"C:\X\y"])),
             s(&[r"C:\A\b", r"C:\A\b c", r"C:\X\y"])
         );
+    }
+
+    /// The parent exits at once, like an Inno/NSIS uninstaller handing off to its %TEMP% copy.
+    #[test]
+    fn waits_for_child_processes() {
+        let t = std::time::Instant::now();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        super::win::run_and_wait(r#"cmd /S /C "start "" /b ping -n 3 127.0.0.1 >nul""#, &cancel).unwrap();
+        assert!(t.elapsed().as_secs_f32() > 1.5, "returned after {:?}", t.elapsed());
     }
 
     /// Read-only run against this machine: `cargo test -- --ignored --nocapture`

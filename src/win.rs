@@ -1,11 +1,18 @@
 //! Win32 glue: program icons and opening URLs / folders.
 use eframe::egui::ColorImage;
 use std::{
+    io,
     mem::zeroed,
     ptr::{null, null_mut},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use windows_sys::Win32::{
+    Foundation::CloseHandle,
     Graphics::Gdi::*,
+    System::{
+        JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation, QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION},
+        Threading::{CreateProcessW, ResumeThread, Sleep, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW},
+    },
     Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives},
     System::WindowsProgramming::DRIVE_FIXED,
     UI::{
@@ -27,6 +34,44 @@ pub fn fixed_drives() -> Vec<std::path::PathBuf> {
         .filter(|d| unsafe { GetDriveTypeW(wide(d).as_ptr()) } == DRIVE_FIXED)
         .map(Into::into)
         .collect()
+}
+
+/// Run `cmdline` and wait until it *and every process it started* have exited. Inno / NSIS
+/// uninstallers copy themselves to %TEMP% and exit at once; the copy still belongs to the job.
+/// Setting `cancel` stops waiting (the uninstaller keeps running).
+pub fn run_and_wait(cmdline: &str, cancel: &AtomicBool) -> io::Result<()> {
+    unsafe {
+        let job = CreateJobObjectW(null(), null());
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..zeroed() };
+        let mut pi: PROCESS_INFORMATION = zeroed();
+        let mut cmd = wide(cmdline);
+        let flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+        if CreateProcessW(null(), cmd.as_mut_ptr(), null(), null(), 0, flags, null(), null(), &si, &mut pi) == 0 {
+            let e = io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(e);
+        }
+        // Suspended until it's in the job, so nothing it spawns can slip out.
+        AssignProcessToJobObject(job, pi.hProcess);
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        while !cancel.load(Ordering::Relaxed) {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+            let size = size_of_val(&info) as u32;
+            if QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &mut info as *mut _ as _, size, null_mut()) == 0
+                || info.ActiveProcesses == 0
+            {
+                break;
+            }
+            Sleep(300);
+        }
+        CloseHandle(job);
+        Ok(())
+    }
 }
 
 /// Open a URL in the default browser or a folder in Explorer.
