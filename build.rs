@@ -1,4 +1,4 @@
-// Uninstalling and cleaning Program Files / HKLM needs admin, like Geek does.
+// Uninstalling and cleaning Program Files / HKLM needs admin.
 // Release only, so `cargo test` / `cargo run` stay unelevated.
 fn main() {
     if std::env::var("PROFILE").as_deref() == Ok("release") {

@@ -67,7 +67,7 @@ fn approved(hive: Hive, sub: &str, name: &str) -> bool {
     hive.root()
         .open_subkey(format!(r"{APPROVED}\{sub}"))
         .and_then(|k| k.get_raw_value(name))
-        .map_or(true, |v| v.bytes.first().map_or(true, |b| b & 1 == 0))
+        .map_or(true, |v| v.bytes.first().is_none_or(|b| b & 1 == 0))
 }
 
 /// Worst sign-in cost per exe (lowercase path) as (CPU µs, disk bytes), from the traces Windows
@@ -77,7 +77,7 @@ fn traces() -> Option<HashMap<String, (u64, u64)>> {
     let mut worst: HashMap<String, (u64, u64)> = HashMap::new();
     for e in fs::read_dir(dir).ok()?.flatten() {
         let Ok(b) = fs::read(e.path()) else { continue };
-        let xml = String::from_utf16_lossy(&b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
+        let xml = String::from_utf16_lossy(&b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<_>>());
         let tag = |p: &str, t: &str| p.split(&format!("<{t} ")).nth(1)?.split('>').nth(1)?.split('<').next()?.parse::<u64>().ok();
         let mut sum: HashMap<String, (u64, u64)> = HashMap::new();
         for p in xml.split("<Process Name=\"").skip(1) {

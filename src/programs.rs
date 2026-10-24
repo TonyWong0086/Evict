@@ -102,7 +102,7 @@ impl Program {
         PathBuf::from(self.location.trim().trim_matches('"'))
     }
 
-    /// Icon sources for when DisplayIcon is empty or stale, in Geek Uninstaller's order: the MSI
+    /// Icon sources for when DisplayIcon is empty or stale, in this order: the MSI
     /// product icon, an exe in the install folder, a Start Menu shortcut with the program's name,
     /// then a generic one.
     pub fn icon_fallbacks(&self, all: &[Program]) -> Vec<String> {
@@ -114,7 +114,7 @@ impl Program {
         }
         v.extend(self.icon_exe(all));
         v.extend(start_menu().get(&lower_name(&self.name)).map(|p| p.display().to_string()));
-        // runtimes and language packs ship no icon at all: the generic application one, as in Geek
+        // runtimes and language packs ship no icon at all: the generic application one
         v.extend(env::var("SystemRoot").map(|r| format!(r"{r}\System32\shell32.dll,2")));
         v
     }
@@ -338,7 +338,7 @@ pub fn list() -> Vec<Program> {
             if name.trim().is_empty() || d("SystemComponent") == Some(1) || !s("ParentKeyName").is_empty() {
                 continue;
             }
-            // No InstallDate → when the uninstall entry was last written, like Geek
+            // No InstallDate → when the uninstall entry was last written
             let date = iso_date(&s("InstallDate"))
                 .or_else(|| {
                     let t = k.query_info().ok()?.get_last_write_time_system();
@@ -357,7 +357,7 @@ pub fn list() -> Vec<Program> {
                 url: s("URLInfoAbout"),
                 hive,
                 key: format!(r"{path}\{sub}"),
-                // Geek's rule: the program's own exe decides, not which registry view the installer used
+                // The program's own exe decides, not which registry view the installer used
                 is32: pe_is_x86(&s("DisplayIcon")).unwrap_or_else(|| {
                     let x86 = env::var_os("ProgramFiles(x86)").map(|v| lower(Path::new(&v)) + "\\");
                     x86.is_some_and(|x| lower(Path::new(s("InstallLocation").trim().trim_matches('"'))).starts_with(&x))

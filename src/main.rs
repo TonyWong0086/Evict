@@ -180,7 +180,7 @@ fn csv_field(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Three significant digits like Geek: "106 GB", "72.8 GB", "8.66 GB".
+/// Three significant digits: "106 GB", "72.8 GB", "8.66 GB".
 pub(crate) fn fmt_bytes(b: u64) -> String {
     if b == 0 {
         return String::new();
@@ -214,7 +214,7 @@ fn url_encode(s: &str) -> String {
         .collect()
 }
 
-/// Geek's Action menu, shown on right-click anywhere in a row.
+/// The Action menu, shown on right-click anywhere in a row.
 fn actions(ui: &mut egui::Ui, first: Option<&Program>, count: usize, act: &mut Option<Act>) {
     let one = first.filter(|_| count == 1);
     let has = |f: fn(&Program) -> &String| one.is_some_and(|p| !f(p).trim().is_empty());
@@ -235,7 +235,7 @@ fn actions(ui: &mut egui::Ui, first: Option<&Program>, count: usize, act: &mut O
     item(ui, one.is_some(), "Google for", Act::Google);
 }
 
-/// Version, Publisher, Size and Installed On are centered, like Geek.
+/// Version, Publisher, Size and Installed On are centered.
 fn centered(col: usize) -> bool {
     (1..=4).contains(&col)
 }
@@ -577,7 +577,7 @@ impl App {
                     self.reload(&ctx);
                 }
                 ui.menu_button("Export", |ui| {
-                    if ui.button("CSV (Excel)").clicked() {
+                    if ui.button("CSV").clicked() {
                         export = Some(false);
                         ui.close_menu();
                     }
@@ -1062,7 +1062,7 @@ impl eframe::App for App {
             self.min_w = w;
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(w, 400.0)));
         }
-        // egui's default text is grey; Geek's is plain white (black in light mode)
+        // egui's default text is grey; use plain white (black in light mode)
         ctx.style_mut(|s| {
             s.visuals.override_text_color = Some(if s.visuals.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK })
         });

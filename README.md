@@ -1,94 +1,128 @@
 # Evict
 
-**A Windows uninstaller that removes the program *and* everything it leaves behind. Written in Rust, free, with no Pro tier.**
+[![Latest release](https://img.shields.io/github/v/release/TonyWong0086/Evict?style=for-the-badge&label=Latest%20release)](https://github.com/TonyWong0086/Evict/releases/latest)
+[![License](https://img.shields.io/github/license/TonyWong0086/Evict?style=for-the-badge&color=grey)](LICENSE)
 
-Evict does what Geek Uninstaller does, plus the features Geek keeps behind its paid version: a real-time installation monitor and a startup manager. It's one ~5 MB exe with no installer, no telemetry and no ads.
+A Windows uninstaller that also removes the files and registry keys a program leaves behind.
 
----
+Single exe, no installer, no telemetry, free.
+
+## Usage
+
+> [!Warning]
+> Evict deletes files and registry keys. You review everything before it goes, but use it at your own risk. Report problems in [Issues](https://github.com/TonyWong0086/Evict/issues).
+
+1. Download `evict.exe` from the [latest release](https://github.com/TonyWong0086/Evict/releases/latest).
+2. Run it and accept the administrator prompt.
+3. Right-click a program and choose **Uninstall**.
+
+The exe isn't code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**.
+
+<details>
+  <summary>Build from source</summary><br/>
+
+  Needs Rust and the MSVC toolchain.
+
+  ```
+  cargo build --release
+  ```
+
+  Output: `target\release\evict.exe`. Debug builds don't ask for admin.
+
+  ```
+  cargo test
+  cargo test -- --ignored --nocapture
+  ```
+
+  The second command is a read-only check against the programs on your machine.
+</details>
 
 ## Features
 
-| | |
-|---|---|
-| **Program list** | Every installed desktop program with its icon, version, publisher, real size, install date and folder. Sort by any column, search as you type, Ctrl+click to select several. |
-| **Clean uninstall** | Runs the program's own uninstaller, **waits for it and every process it spawns to finish**, then scans for leftover files, folders and registry keys. You review a File System / Registry tree, with sizes, and tick what goes. |
-| **Deep leftover scan** | Also finds what still points at the old install folder: Start Menu and Desktop shortcuts, Run entries, App Paths and services, plus temp folders named after the program. |
-| **Shared file protection** | Leftovers another installed program still uses (a shared vendor folder, a DLL with a SharedDLLs count of 2+) are shown as *Kept* and never offered for removal. |
-| **Ghost entries** | Finds programs that are already gone but still listed (their uninstaller and folder no longer exist) and removes the stale entries in one go. |
-| **Force removal** | For programs whose uninstaller is broken or missing: skip it and go straight to the leftover scan. |
-| **Real sizes** | Sizes are measured on disk, mods and caches included, not taken from what the installer reported. See [How sizes work](#how-sizes-work). |
-| **Install monitor** | Snapshots the registry and watches the disk while an installer runs, then saves everything it added as a *trace*. Uninstalling a traced program removes exactly what was installed. *(Pro in Geek)* |
-| **Startup manager** | Turn programs that run at sign-in on or off (the same switch Task Manager uses), or delete the entry. *(Pro in Geek)* |
-| **Bloatware remover** | The Store apps tab marks preinstalled apps most people never use (Bing News, Solitaire, Clipchamp, Candy Crush…). Select them in one click, review, and remove. |
-| **Uninstall history** | Every removal is logged with its date, how many items went and how much space was freed. |
-| **Export** | Save the program list, with real sizes and folders, as CSV (opens in Excel) or JSON. |
-| **Right-click menu** | Right-click anywhere in a row: Uninstall, Force Removal, Remove Entry, Modify, Installation Folder, Registry Entry, Program Website, Google for. |
+#### Uninstall
+
+- Runs the program's uninstaller and waits until it and its child processes exit.
+- Then scans for leftover files, folders and registry keys.
+- Force removal skips a broken or missing uninstaller and goes straight to the scan.
+- Select several programs to uninstall them in a row. If you cancel one uninstaller, only that program is skipped.
+
+#### Leftovers
+
+- Folders and keys named after the program in Program Files, AppData, ProgramData and the registry.
+- Shortcuts, Run entries, App Paths and services that still point at the old folder.
+- Files another installed program still uses are kept and never offered for removal.
+
+#### Program list
+
+- Sizes are measured on disk, including data folders. See [Sizes](#sizes).
+- Shows icon, version, publisher, size, install date and folder. Sort by any column.
+- Finds entries whose program is already gone and removes them.
+- Export to CSV or JSON.
+
+#### Other tabs
+
+- **Store apps:** remove Store apps. Common preinstalled ones are marked so you can select them in one click.
+- **Startup:** turn sign-in programs on or off, with the same High / Medium / Low impact rating Windows uses.
+- **Install monitor:** record what an installer adds, so uninstalling later removes exactly that.
+- **History:** every removal with its date, item count and space freed.
 
 ## Keyboard
 
-| Key | Does |
+| Key | Action |
 |---|---|
-| Delete / Shift+Delete | Uninstall / Force Removal |
-| Up, Down (Shift extends) | Move the selection |
-| Shift+click, Ctrl+click | Select a range / toggle one |
-| Ctrl+A | Select every listed program |
-| Ctrl+F, or just start typing | Search |
-| Esc | Clear the search |
+| Delete | Uninstall |
+| Shift+Delete | Force removal |
+| Up / Down | Move selection, Shift to extend |
+| Ctrl+A | Select all |
+| Ctrl+F or start typing | Search |
+| Esc | Clear search |
 | F5 | Refresh |
 
-Window size, column widths, sort order and the open tab are remembered between runs.
+Window size, column widths, sort order and the last tab are saved between runs.
 
 ## Safety
 
-Evict deletes things, so it's built to be cautious:
+- Nothing is deleted until you confirm the list. You can expand any folder or key first.
+- Drive roots, `Windows`, your user folder and the Program Files / AppData / ProgramData roots are never removed.
+- A folder only counts as a leftover if its name matches the program's exactly, ignoring version numbers and suffixes like "x64".
+- If a program still looks installed after its uninstaller, its leftovers aren't scanned.
+- Same-named folders found elsewhere on a drive count toward the size but are never offered for deletion.
 
-- **Nothing is deleted without your review.** Every removal goes through the leftovers dialog, where you can expand each folder and key to see what's inside.
-- **Shared folders are never offered.** If another program lives in or under a folder (e.g. `Program Files\Adobe`), it isn't treated as a leftover.
-- **Protected locations are off-limits:** drive roots, `Windows`, your user folder, and the Program Files / AppData / ProgramData roots themselves.
-- **Exact name matching only.** A folder counts as a leftover only when its name matches the program's (ignoring version numbers and suffixes like "Inc." or "x64"). No fuzzy guessing.
-- **Cancelled uninstalls are detected.** If the program still looks installed afterwards, nothing is pre-ticked.
-- **Drive-wide matches are for sizing only.** A same-named folder like `D:\Blender` might be your own projects, so Evict counts it in the size but never offers to delete it.
+## Sizes
 
-## How sizes work
+<details>
+  <summary>How sizes are measured</summary><br/>
 
-For each program, Evict adds up:
+  A program's size is the sum of:
 
-1. **The install folder.** It comes from the registry or, when that's missing or wrong, from Steam's library files (Steam games don't record one), the program's own subfolder inside a shared vendor folder, or the folder of its exe. It also steps out of version subfolders (`Roblox\Versions\version-…` → `Roblox`), so caches stored next to them count.
-2. **Data folders named after the program** in AppData (Roaming, Local, LocalLow), ProgramData, and the top two levels of every fixed drive.
+  1. Its install folder. If the registry doesn't say where that is, Evict checks game library files, the program's subfolder inside a shared vendor folder, or the folder of its exe.
+  2. Folders named after it in AppData, ProgramData and the top two levels of each fixed drive.
 
-Other programs installed inside a folder (games inside Steam) are subtracted. Programs with nothing to measure fall back to the size their installer reported.
+  Programs installed inside another program's folder are subtracted from it. If nothing can be measured, the size the installer reported is used.
+</details>
 
-## Build
+## Source layout
 
-Requires Rust (stable) and the MSVC toolchain.
+<details>
+  <summary>Files in <code>src/</code></summary><br/>
 
-```
-cargo build --release
-```
+  | File | Contents |
+  |---|---|
+  | `main.rs` | Window, tabs, program table, right-click menu |
+  | `programs.rs` | Installed programs, folders, sizes, icons, leftovers |
+  | `cleanup.rs` | Uninstall progress and leftovers dialogs |
+  | `startup.rs` | Startup entries and impact |
+  | `monitor.rs` | Install monitor |
+  | `history.rs` | Uninstall history |
+  | `settings.rs` | Saved layout |
+  | `theme.rs` | Fonts and spacing |
+  | `win.rs` | Win32 calls |
+</details>
 
-The exe is `target\release\evict.exe`. Release builds ask for administrator rights at start, since removing programs and cleaning Program Files needs them; debug builds don't.
+## Contributing
 
-```
-cargo test                            # unit tests
-cargo test -- --ignored --nocapture   # read-only check against this machine
-```
-
-## Project layout
-
-| File | What's in it |
-|---|---|
-| `src/main.rs` | Window, tabs, program table, right-click menu |
-| `src/programs.rs` | Reading installed programs, install folders, sizes, leftover matching, deep scan, ghosts, shared file protection |
-| `src/cleanup.rs` | Uninstall progress and leftovers dialogs |
-| `src/history.rs` | Uninstall history |
-| `src/settings.rs` | Remembered window and list layout |
-| `src/theme.rs` | Fonts, spacing and shapes |
-| `src/monitor.rs` | Installation monitor and traces |
-| `src/startup.rs` | Startup entries |
-| `src/win.rs` | Win32 glue: icons, opening links, drives, waiting on uninstallers |
+See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Evict is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE).
-
-You can use, study, share and modify it. If you distribute a modified version, you must release its source under the same license, so Evict and anything built from it stay free.
+[GPL-3.0-or-later](LICENSE). If you distribute a modified version, you have to publish its source under the same license.
