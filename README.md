@@ -24,6 +24,20 @@ Evict does what Geek Uninstaller does, plus the features Geek keeps behind its p
 | **Export** | Save the program list, with real sizes and folders, as CSV (opens in Excel) or JSON. |
 | **Right-click menu** | Right-click anywhere in a row: Uninstall, Force Removal, Remove Entry, Modify, Installation Folder, Registry Entry, Program Website, Google for. |
 
+## Keyboard
+
+| Key | Does |
+|---|---|
+| Delete / Shift+Delete | Uninstall / Force Removal |
+| Up, Down (Shift extends) | Move the selection |
+| Shift+click, Ctrl+click | Select a range / toggle one |
+| Ctrl+A | Select every listed program |
+| Ctrl+F, or just start typing | Search |
+| Esc | Clear the search |
+| F5 | Refresh |
+
+Window size, column widths, sort order and the open tab are remembered between runs.
+
 ## Safety
 
 Evict deletes things, so it's built to be cautious:
@@ -67,6 +81,8 @@ cargo test -- --ignored --nocapture   # read-only check against this machine
 | `src/programs.rs` | Reading installed programs, install folders, sizes, leftover matching, deep scan, ghosts, shared file protection |
 | `src/cleanup.rs` | Uninstall progress and leftovers dialogs |
 | `src/history.rs` | Uninstall history |
+| `src/settings.rs` | Remembered window and list layout |
+| `src/theme.rs` | Fonts, spacing and shapes |
 | `src/monitor.rs` | Installation monitor and traces |
 | `src/startup.rs` | Startup entries |
 | `src/win.rs` | Win32 glue: icons, opening links, drives, waiting on uninstallers |

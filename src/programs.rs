@@ -418,7 +418,7 @@ pub struct DirIndex(Vec<(String, PathBuf)>);
 
 impl DirIndex {
     /// Children of Program Files / AppData / ProgramData. `all_drives` adds the top two levels of every
-    /// fixed drive (D:\Roblox, E:\Games\OMSI…) — fine for sizing, too loose for deletion.
+    /// fixed drive (D:\Roblox, E:\Games\OMSI…): fine for sizing, too loose for deletion.
     pub fn build(all_drives: bool) -> Self {
         let mut bases = search_dirs();
         if all_drives {

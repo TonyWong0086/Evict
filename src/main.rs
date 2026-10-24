@@ -3,7 +3,9 @@ mod cleanup;
 mod history;
 mod monitor;
 mod programs;
+mod settings;
 mod startup;
+mod theme;
 mod win;
 
 use eframe::egui;
@@ -45,6 +47,17 @@ enum Col {
     Folder,
 }
 
+impl Col {
+    const ALL: [(Col, &'static str); 6] = [
+        (Col::Name, "Program Name"),
+        (Col::Version, "Version"),
+        (Col::Publisher, "Publisher"),
+        (Col::Size, "Size"),
+        (Col::Date, "Installed On"),
+        (Col::Folder, "Folder"),
+    ];
+}
+
 #[derive(Clone, Copy)]
 enum Act {
     Uninstall,
@@ -64,6 +77,11 @@ enum Tab {
     Startup,
     Monitor,
     History,
+}
+
+impl Tab {
+    const ALL: [(Tab, &'static str); 5] =
+        [(Tab::Programs, "Programs"), (Tab::Store, "Store apps"), (Tab::Startup, "Startup"), (Tab::Monitor, "Install monitor"), (Tab::History, "History")];
 }
 
 struct StoreApp {
@@ -93,6 +111,11 @@ struct App {
     sel: BTreeSet<String>,
     sort: (Col, bool),
     sizes: HashMap<String, u64>,
+    /// row the keyboard moves from (last clicked / arrowed to)
+    cursor: Option<String>,
+    scroll_to: Option<usize>,
+    focus_search: bool,
+    window: [f32; 2],
     folders: HashMap<String, String>,
     col_w: [f32; 5],
     icons: HashMap<String, egui::TextureHandle>,
@@ -220,8 +243,29 @@ fn cell(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).selectable(false).truncate());
 }
 
-fn short(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.into() } else { s.chars().take(n).collect::<String>() + "…" }
+/// The table style every tab shares: striped, no divider lines, a stretching last column.
+fn list_table<'a>(ui: &'a mut egui::Ui, widths: &[f32]) -> TableBuilder<'a> {
+    let mut t = TableBuilder::new(ui).striped(true).cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+    for w in widths {
+        t = t.column(Column::exact(*w).clip(true));
+    }
+    t.column(Column::remainder().at_least(80.0).clip(true))
+}
+
+/// Column titles in weak text, the way the Programs header looks.
+fn head(h: &mut egui_extras::TableRow, labels: &[&str]) {
+    for l in labels {
+        h.col(|ui| cell(ui, egui::RichText::new(*l).color(ui.visuals().weak_text_color())));
+    }
+}
+
+fn toolbar(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 4.0)).show(ui, |ui| drop(ui.horizontal(add)));
+}
+
+fn empty(ui: &mut egui::Ui, msg: &str) {
+    ui.add_space(32.0);
+    ui.vertical_centered(|ui| ui.label(egui::RichText::new(msg).weak()));
 }
 
 /// Two-click delete: first click arms, second click confirms.
@@ -231,7 +275,7 @@ fn confirm_button(ui: &mut egui::Ui, armed: &mut Option<(Tab, usize)>, key: (Tab
             *armed = None;
             return true;
         }
-    } else if ui.small_button(label).clicked() {
+    } else if ui.button(label).clicked() {
         *armed = Some(key);
     }
     false
@@ -239,25 +283,22 @@ fn confirm_button(ui: &mut egui::Ui, armed: &mut Option<(Tab, usize)>, key: (Tab
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
-        // CJK / symbol fallback so non-English program names don't render as boxes
-        let mut fonts = egui::FontDefinitions::default();
-        for f in ["msyh.ttc", "seguisym.ttf"] {
-            if let Ok(b) = std::fs::read(format!(r"C:\Windows\Fonts\{f}")) {
-                fonts.font_data.insert(f.into(), egui::FontData::from_owned(b));
-                fonts.families.values_mut().for_each(|fam| fam.push(f.into()));
-            }
-        }
-        cc.egui_ctx.set_fonts(fonts);
+        theme::apply(&cc.egui_ctx);
+        let st = settings::load();
         let (tx, rx) = mpsc::channel();
         let mut app = App {
-            tab: Tab::Programs,
+            tab: Tab::ALL.get(st.tab).map_or(Tab::Programs, |t| t.0),
             filter: String::new(),
             programs: Vec::new(),
             sel: BTreeSet::new(),
-            sort: (Col::Name, true),
+            sort: (Col::ALL.get(st.sort.0).map_or(Col::Name, |c| c.0), st.sort.1),
             sizes: HashMap::new(),
+            cursor: None,
+            scroll_to: None,
+            focus_search: false,
+            window: st.window,
             folders: HashMap::new(),
-            col_w: [340.0, 110.0, 190.0, 85.0, 110.0],
+            col_w: st.col_w,
             icons: HashMap::new(),
             loading: HashSet::new(),
             store: Vec::new(),
@@ -476,29 +517,81 @@ impl App {
         let mut act = None;
         let ghosts: Vec<Program> = self.programs.iter().filter(|p| p.ghost).cloned().collect();
         let mut export = None;
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("🔎 Type to find a program").desired_width(240.0));
-            if ui.button("⟳ Refresh").clicked() {
-                self.reload(&ctx);
-            }
-            ui.menu_button("⤓ Export", |ui| {
-                if ui.button("CSV (Excel)").clicked() {
-                    export = Some(false);
-                    ui.close_menu();
+        let search_id = egui::Id::new("evict_search");
+
+        // Keyboard. Ctrl+F, Esc and F5 work everywhere; the rest only when no text box has focus.
+        let typing = ctx.wants_keyboard_input();
+        let keys = ctx.input(|i| {
+            let k = |key| i.key_pressed(key);
+            let text: String = if typing || i.modifiers.command {
+                String::new()
+            } else {
+                i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None }).collect()
+            };
+            // modifiers as they were when each key went down, not just at the end of the frame
+            let m = i.events.iter().fold(i.modifiers, |m, e| match e {
+                egui::Event::Key { pressed: true, modifiers, .. } => m | *modifiers,
+                _ => m,
+            });
+            (m, k(egui::Key::Delete), k(egui::Key::F5), k(egui::Key::F), k(egui::Key::A), k(egui::Key::Escape), i.num_presses(egui::Key::ArrowUp), i.num_presses(egui::Key::ArrowDown), text)
+        });
+        let (m, del, f5, f, a, esc, up, down, text) = keys;
+        if f5 {
+            self.reload(&ctx);
+        }
+        if m.command && f {
+            self.focus_search = true;
+        }
+        if esc && !self.filter.is_empty() {
+            self.filter.clear();
+            ctx.memory_mut(|mem| mem.surrender_focus(search_id));
+        }
+        if !text.is_empty() {
+            self.filter.push_str(&text);
+            self.focus_search = true;
+        }
+        if !typing && del && !self.sel.is_empty() {
+            act = Some(if m.shift { Act::Force } else { Act::Uninstall });
+        }
+
+        egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 4.0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let r = ui.add(theme::field(ui, &mut self.filter, "Search programs", 260.0).id(search_id));
+                if std::mem::take(&mut self.focus_search) {
+                    r.request_focus();
+                    // put the caret after what was typed, not select-all
+                    if let Some(mut st) = egui::TextEdit::load_state(&ctx, search_id) {
+                        let end = egui::text::CCursor::new(self.filter.chars().count());
+                        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                        st.store(&ctx, search_id);
+                    }
                 }
-                if ui.button("JSON").clicked() {
-                    export = Some(true);
-                    ui.close_menu();
+                if ui.button("Refresh").on_hover_text("F5").clicked() {
+                    self.reload(&ctx);
+                }
+                ui.menu_button("Export", |ui| {
+                    if ui.button("CSV (Excel)").clicked() {
+                        export = Some(false);
+                        ui.close_menu();
+                    }
+                    if ui.button("JSON").clicked() {
+                        export = Some(true);
+                        ui.close_menu();
+                    }
+                });
+                if !ghosts.is_empty() || self.ghosts_only {
+                    ui.separator();
+                    let b = ui.add(egui::Button::new(format!("Ghosts ({})", ghosts.len())).selected(self.ghosts_only).rounding(4.0)); // egui draws selected buttons square otherwise
+                    if b.clicked() {
+                        self.ghosts_only = !self.ghosts_only;
+                    }
+                    b
+                        .on_hover_text("Entries whose program is already gone: the uninstaller and install folder no longer exist.");
+                    if self.ghosts_only && ui.add_enabled(!ghosts.is_empty(), egui::Button::new("Remove all ghost entries")).clicked() {
+                        self.review(&ctx, ghosts.iter().map(|p| Item::Key(p.hive, p.key.clone())).collect(), ghosts.clone());
+                    }
                 }
             });
-            if !ghosts.is_empty() || self.ghosts_only {
-                ui.separator();
-                ui.toggle_value(&mut self.ghosts_only, format!("👻 Ghosts ({})", ghosts.len()))
-                    .on_hover_text("Entries whose program is already gone: the uninstaller and install folder no longer exist.");
-                if self.ghosts_only && ui.add_enabled(!ghosts.is_empty(), egui::Button::new("Remove all ghost entries")).clicked() {
-                    self.review(&ctx, ghosts.iter().map(|p| Item::Key(p.hive, p.key.clone())).collect(), ghosts.clone());
-                }
-            }
         });
         if let Some(json) = export {
             self.status = match self.export(json) {
@@ -509,14 +602,13 @@ impl App {
                 Err(e) => format!("Export failed: {e}"),
             };
         }
-        ui.separator();
 
-        let f = self.filter.to_lowercase();
+        let flt = self.filter.to_lowercase();
         let mut rows: Vec<&Program> = self
             .programs
             .iter()
             .filter(|p| !self.ghosts_only || p.ghost)
-            .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f) || p.publisher.to_lowercase().contains(&f))
+            .filter(|p| flt.is_empty() || p.name.to_lowercase().contains(&flt) || p.publisher.to_lowercase().contains(&flt))
             .collect();
         let (col, asc) = self.sort;
         rows.sort_by(|a, b| {
@@ -530,37 +622,52 @@ impl App {
             };
             if asc { o } else { o.reverse() }
         });
+        let ids: Vec<String> = rows.iter().map(|p| p.id()).collect();
+
+        // Arrow keys move from the cursor row; Shift extends the selection. Ctrl+A selects what's visible.
+        if !typing && m.command && a {
+            self.sel = ids.iter().cloned().collect();
+        }
+        if !typing && (up + down) > 0 && !ids.is_empty() {
+            let at = self.cursor.as_ref().and_then(|c| ids.iter().position(|i| i == c));
+            let next = match at {
+                None => 0,
+                Some(i) => (i + down).saturating_sub(up).min(ids.len() - 1),
+            };
+            if !m.shift {
+                self.sel.clear();
+            }
+            self.sel.insert(ids[next].clone());
+            self.cursor = Some(ids[next].clone());
+            self.scroll_to = Some(next);
+        }
 
         let (mut new_sort, mut click, mut resize) = (None, None, None);
         let count = self.sel.len();
+        let weak = ui.visuals().weak_text_color();
         // Columns resize from grips in the header only, so the list has no divider lines.
         let mut table = TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+        if let Some(r) = self.scroll_to.take() {
+            table = table.scroll_to_row(r, None);
+        }
         for w in self.col_w {
             table = table.column(Column::exact(w).clip(true));
         }
         table
             .column(Column::remainder().at_least(150.0).clip(true))
-            .header(24.0, |mut h| {
-                let heads = [
-                    (Col::Name, "Program Name"),
-                    (Col::Version, "Version"),
-                    (Col::Publisher, "Publisher"),
-                    (Col::Size, "Size"),
-                    (Col::Date, "Installed On"),
-                    (Col::Folder, "Folder"),
-                ];
-                for (i, (c, label)) in heads.into_iter().enumerate() {
+            .header(28.0, |mut h| {
+                for (i, (c, label)) in Col::ALL.into_iter().enumerate() {
                     h.col(|ui| {
                         let rect = ui.max_rect();
                         let arrow = match (col == c, asc) {
                             (false, _) => "",
-                            (true, true) => " ▲",
-                            (true, false) => " ▼",
+                            (true, true) => "  ▲",
+                            (true, false) => "  ▼",
                         };
-                        let text = egui::RichText::new(format!("{label}{arrow}")).strong();
+                        let text = egui::RichText::new(format!("{label}{arrow}")).color(weak);
                         let label = egui::Label::new(text).selectable(false).sense(egui::Sense::click());
                         let r = if centered(i) { ui.centered_and_justified(|ui| ui.add(label)).inner } else { ui.add(label) };
                         if r.clicked() {
@@ -581,44 +688,53 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(24.0, rows.len(), |mut row| {
+                body.rows(28.0, rows.len(), |mut row| {
                     let p = rows[row.index()];
                     let id = p.id();
                     row.set_selected(self.sel.contains(&id));
                     let mut cells = vec![row
                         .col(|ui| {
+                            ui.add_space(4.0);
                             match self.icons.get(&id) {
                                 Some(t) => drop(ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(18.0, 18.0)))),
-                                None => ui.add_space(22.0),
+                                None => ui.add_space(18.0),
                             }
                             cell(ui, p.name.as_str());
                             if p.ghost {
-                                cell(ui, egui::RichText::new("(ghost)").color(egui::Color32::from_rgb(240, 180, 60)));
+                                cell(ui, egui::RichText::new("ghost").color(theme::AMBER).small());
                             }
                             if p.is32 {
-                                cell(ui, egui::RichText::new("(32-bit)").weak());
+                                cell(ui, egui::RichText::new("32-bit").weak().small());
                             }
                             if self.traces.iter().any(|t| t.matches(p)) {
-                                cell(ui, egui::RichText::new("[traced]").weak());
+                                cell(ui, egui::RichText::new("traced").weak().small());
                             }
                         })
                         .1];
                     let mid = |ui: &mut egui::Ui, t: String| drop(ui.centered_and_justified(|ui| cell(ui, t)));
                     cells.push(row.col(|ui| mid(ui, p.version.clone())).1);
                     cells.push(row.col(|ui| mid(ui, p.publisher.clone())).1);
-                    cells.push(row.col(|ui| mid(ui, fmt_bytes(self.size_of(p)))).1);
+                    cells.push(
+                        row.col(|ui| {
+                            if self.sizes.contains_key(&id) || !self.loading.contains(&id) {
+                                mid(ui, fmt_bytes(self.size_of(p)));
+                            } else {
+                                // still measuring: a placeholder bar, not the installer's guess
+                                let bar = egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(46.0, 8.0));
+                                ui.painter().rect_filled(bar, 4.0, ui.visuals().widgets.inactive.bg_fill);
+                            }
+                        })
+                        .1,
+                    );
                     cells.push(row.col(|ui| mid(ui, programs::pretty_date(&p.date))).1);
                     cells.push(row.col(|ui| cell(ui, self.folder_of(p))).1);
 
                     let r = row.response();
-                    if r.clicked() || r.double_clicked() {
-                        click = Some((id.clone(), r.ctx.input(|i| i.modifiers.command)));
+                    if r.clicked() || r.double_clicked() || (r.secondary_clicked() && !self.sel.contains(&id)) {
+                        click = Some((row.index(), r.ctx.input(|i| i.modifiers)));
                     }
                     if r.double_clicked() {
                         act = Some(Act::Uninstall);
-                    }
-                    if r.secondary_clicked() && !self.sel.contains(&id) {
-                        click = Some((id.clone(), false));
                     }
                     let n = if self.sel.contains(&id) { count } else { 1 };
                     // The row's combined response keeps only the first cell's id, so the menu goes on every cell.
@@ -628,12 +744,27 @@ impl App {
                 });
             });
 
-        if let Some((id, ctrl)) = click {
-            if !ctrl {
-                self.sel.clear();
-            }
-            if !self.sel.remove(&id) || !ctrl {
-                self.sel.insert(id);
+        // Click selects, Ctrl+click toggles, Shift+click selects the range from the cursor row.
+        if let Some((i, m)) = click {
+            let id = ids[i].clone();
+            let anchor = self.cursor.as_ref().and_then(|c| ids.iter().position(|x| x == c));
+            match anchor {
+                Some(a) if m.shift => {
+                    if !m.command {
+                        self.sel.clear();
+                    }
+                    self.sel.extend(ids[a.min(i)..=a.max(i)].iter().cloned());
+                }
+                _ if m.command => {
+                    if !self.sel.remove(&id) {
+                        self.sel.insert(id.clone());
+                    }
+                    self.cursor = Some(id);
+                }
+                _ => {
+                    self.sel = [id.clone()].into();
+                    self.cursor = Some(id);
+                }
             }
         }
         if let Some((i, dx)) = resize {
@@ -642,6 +773,10 @@ impl App {
         if let Some(c) = new_sort {
             let default_desc = matches!(c, Col::Size | Col::Date);
             self.sort = if self.sort.0 == c { (c, !self.sort.1) } else { (c, !default_desc) };
+        }
+        if rows.is_empty() && !self.programs.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| ui.label(egui::RichText::new(format!("No programs match \"{}\". Press Esc to clear the search.", self.filter)).weak()));
         }
         if let Some(a) = act {
             self.run(&ctx, a);
@@ -652,9 +787,9 @@ impl App {
         let ctx = ui.ctx().clone();
         let bloat = self.store.iter().filter(|a| a.bloat).count();
         let mut remove = false;
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("🔎 Search").desired_width(200.0));
-            if ui.button("⟳ Refresh").clicked() {
+        toolbar(ui, |ui| {
+            ui.add(theme::field(ui, &mut self.filter, "Search Store apps", 260.0));
+            if ui.button("Refresh").clicked() {
                 self.store_loaded = false;
             }
             ui.separator();
@@ -666,38 +801,34 @@ impl App {
             }
             let n = self.store_sel.len();
             ui.add_enabled_ui(n > 0, |ui| remove = confirm_button(ui, &mut self.confirm, (Tab::Store, 0), &format!("Remove {n} selected")));
-            ui.label(egui::RichText::new(format!("{} apps", self.store.len())).weak());
         });
-        ui.separator();
         let f = self.filter.to_lowercase();
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("store").striped(true).num_columns(4).spacing([16.0, 6.0]).show(ui, |ui| {
-                for h in ["", "Name", "Version", ""] {
-                    ui.strong(h);
-                }
-                ui.end_row();
-                for a in &self.store {
-                    if !f.is_empty() && !a.name.to_lowercase().contains(&f) {
-                        continue;
-                    }
+        let rows: Vec<usize> = (0..self.store.len()).filter(|&i| f.is_empty() || self.store[i].name.to_lowercase().contains(&f)).collect();
+        if rows.is_empty() {
+            let msg = if self.busy > 0 { "Loading Store apps..." } else { "No removable Store apps found." };
+            return empty(ui, msg);
+        }
+        list_table(ui, &[36.0, 420.0, 180.0]).header(28.0, |mut h| head(&mut h, &["", "Name", "Version", ""])).body(|body| {
+            body.rows(26.0, rows.len(), |mut row| {
+                let a = &self.store[rows[row.index()]];
+                row.col(|ui| {
                     let mut on = self.store_sel.contains(&a.full);
                     if ui.checkbox(&mut on, "").changed() {
                         if on { self.store_sel.insert(a.full.clone()) } else { self.store_sel.remove(&a.full) };
                     }
-                    ui.label(&a.name);
-                    ui.label(&a.version);
+                });
+                row.col(|ui| cell(ui, a.name.as_str()));
+                row.col(|ui| cell(ui, a.version.as_str()));
+                row.col(|ui| {
                     if a.bloat {
-                        ui.label(egui::RichText::new("bloatware").color(egui::Color32::from_rgb(240, 180, 60)).small());
-                    } else {
-                        ui.label("");
+                        cell(ui, egui::RichText::new("bloatware").color(theme::AMBER).small());
                     }
-                    ui.end_row();
-                }
+                });
             });
         });
         if remove {
             let full: Vec<String> = self.store_sel.drain().collect();
-            self.status = format!("Removing {} app(s)…", full.len());
+            self.status = format!("Removing {} app(s)...", full.len());
             self.job(&ctx, move || {
                 let list = full.iter().map(|f| format!("'{}'", f.replace('\'', "''"))).collect::<Vec<_>>().join(",");
                 powershell(&format!("{list} | ForEach-Object {{ Remove-AppxPackage -Package $_ }}"));
@@ -707,35 +838,36 @@ impl App {
     }
 
     fn startup_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        toolbar(ui, |ui| {
             if ui.button("Refresh").clicked() {
                 self.startup = startup::list();
             }
-            ui.label("Untick to stop a program from running at sign-in (same switch Task Manager uses).");
+            ui.label(egui::RichText::new("Untick to stop a program from running at sign-in (the same switch Task Manager uses).").weak());
         });
-        ui.separator();
+        if self.startup.is_empty() {
+            return empty(ui, "Nothing runs at sign-in.");
+        }
         let (mut del, mut err) = (None, None);
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("startup").striped(true).num_columns(5).show(ui, |ui| {
-                for h in ["On", "Name", "Command", "Location", ""] {
-                    ui.strong(h);
-                }
-                ui.end_row();
-                for (i, e) in self.startup.iter_mut().enumerate() {
+        list_table(ui, &[44.0, 240.0, 460.0, 280.0]).header(28.0, |mut h| head(&mut h, &["On", "Name", "Command", "Location", ""])).body(|body| {
+            body.rows(26.0, self.startup.len(), |mut row| {
+                let i = row.index();
+                let e = &mut self.startup[i];
+                row.col(|ui| {
                     let mut on = e.enabled;
                     if ui.checkbox(&mut on, "").changed() {
                         if let Err(x) = e.set_enabled(on) {
                             err = Some(format!("{}: {x}", e.name));
                         }
                     }
-                    ui.label(&e.name);
-                    ui.label(short(&e.command, 70)).on_hover_text(&e.command);
-                    ui.label(short(&e.location(), 60)).on_hover_text(e.location());
+                });
+                row.col(|ui| cell(ui, e.name.as_str()));
+                row.col(|ui| drop(ui.add(egui::Label::new(e.command.as_str()).truncate()).on_hover_text(&e.command)));
+                row.col(|ui| drop(ui.add(egui::Label::new(e.location()).truncate()).on_hover_text(e.location())));
+                row.col(|ui| {
                     if confirm_button(ui, &mut self.confirm, (Tab::Startup, i), "Delete") {
                         del = Some(i);
                     }
-                    ui.end_row();
-                }
+                });
             });
         });
         if let Some(i) = del {
@@ -751,55 +883,62 @@ impl App {
 
     fn monitor_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.heading("Real-time installation monitor");
-        ui.label("Evict snapshots the registry, watches the disk while an installer runs, and saves everything it added as a trace. Uninstalling a traced program later removes exactly what was installed.");
         ui.add_space(6.0);
+        ui.heading("Installation monitor");
+        ui.label(egui::RichText::new("Evict snapshots the registry and watches the disk while an installer runs, then saves everything it added as a trace. Uninstalling a traced program later removes exactly what was installed.").weak());
+        ui.add_space(8.0);
         let mut stop = false;
         if let Some(m) = &self.monitor {
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Watching… {} new paths so far", m.created.len()));
-                stop = ui.button("Stop & save trace").clicked();
+                ui.label(theme::semibold(format!("Watching: {} new paths so far", m.created.len())));
+                stop = ui.button("Stop and save trace").clicked();
             });
-            ui.small("Finish the installer completely before stopping.");
-            egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
-                for p in m.created.iter().rev().take(300) {
-                    ui.monospace(p.display().to_string());
-                }
+            ui.label(egui::RichText::new("Let the installer finish completely before stopping.").weak().small());
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+                    for p in m.created.iter().rev().take(300) {
+                        ui.monospace(p.display().to_string());
+                    }
+                });
             });
         } else {
             ui.horizontal(|ui| {
-                ui.label("Installer:");
-                ui.add(egui::TextEdit::singleline(&mut self.installer).hint_text("drop an .exe / .msi here, or leave empty").desired_width(420.0));
+                ui.add(theme::field(ui, &mut self.installer, "Installer path (drop an .exe or .msi here), or leave empty", 460.0));
                 if ui.add_enabled(self.busy == 0, egui::Button::new("Start monitoring")).clicked() {
                     let inst = self.installer.clone();
-                    self.status = "Taking registry snapshot…".into();
+                    self.status = "Taking registry snapshot...".into();
                     self.job(&ctx, move || Msg::Monitor(monitor::start(inst)));
                 }
             });
         }
         if stop {
             let s = self.monitor.take().unwrap();
-            self.status = "Comparing registry…".into();
+            self.status = "Comparing registry...".into();
             self.job(&ctx, move || Msg::Trace(s.finish()));
         }
 
-        ui.separator();
+        ui.add_space(12.0);
         ui.heading("Traces");
+        if self.traces.is_empty() {
+            return empty(ui, "No traces yet. Start the monitor before running an installer to record one.");
+        }
         let (mut clean, mut del) = (None, None);
-        egui::ScrollArea::vertical().id_salt("traces").auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("traces").striped(true).num_columns(4).show(ui, |ui| {
-                for (i, t) in self.traces.iter().enumerate() {
-                    ui.label(&t.name);
-                    ui.label(format!("{} items", t.items.len()));
-                    if ui.small_button("Remove installed items").clicked() {
+        list_table(ui, &[340.0, 110.0, 190.0]).header(28.0, |mut h| head(&mut h, &["Name", "Items", "", ""])).body(|body| {
+            body.rows(26.0, self.traces.len(), |mut row| {
+                let i = row.index();
+                let t = &self.traces[i];
+                row.col(|ui| cell(ui, t.name.as_str()));
+                row.col(|ui| cell(ui, t.items.len().to_string()));
+                row.col(|ui| {
+                    if ui.button("Remove installed items").clicked() {
                         clean = Some(i);
                     }
+                });
+                row.col(|ui| {
                     if confirm_button(ui, &mut self.confirm, (Tab::Monitor, i), "Forget trace") {
                         del = Some(i);
                     }
-                    ui.end_row();
-                }
+                });
             });
         });
         if let Some(i) = clean {
@@ -858,34 +997,26 @@ impl App {
     fn history_ui(&mut self, ui: &mut egui::Ui) {
         let (freed, items) = self.history.iter().fold((0, 0), |(b, n), e| (b + e.bytes, n + e.items));
         let mut clear = false;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("{} uninstalls · {items} items removed · {} freed", self.history.len(), bytes_or_zero(freed))).strong());
+        toolbar(ui, |ui| {
+            let n = self.history.len();
+            ui.label(theme::semibold(format!("{n} uninstall{}, {items} items removed, {} freed", if n == 1 { "" } else { "s" }, bytes_or_zero(freed))));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(!self.history.is_empty(), |ui| clear = confirm_button(ui, &mut self.confirm, (Tab::History, 0), "Clear history"));
+                ui.add_enabled_ui(n > 0, |ui| clear = confirm_button(ui, &mut self.confirm, (Tab::History, 0), "Clear history"));
             });
         });
-        ui.separator();
         if self.history.is_empty() {
-            ui.add_space(30.0);
-            ui.vertical_centered(|ui| ui.label(egui::RichText::new("Programs you uninstall with Evict are listed here.").weak()));
+            return empty(ui, "Nothing uninstalled with Evict yet. Programs you remove show up here.");
         }
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("history").striped(true).num_columns(6).spacing([20.0, 6.0]).show(ui, |ui| {
-                if !self.history.is_empty() {
-                    for h in ["When", "Program", "Version", "Publisher", "Items removed", "Freed"] {
-                        ui.strong(h);
-                    }
-                    ui.end_row();
-                }
-                for e in self.history.iter().rev() {
-                    ui.label(&e.when);
-                    ui.label(&e.name);
-                    ui.label(&e.version);
-                    ui.label(&e.publisher);
-                    ui.label(e.items.to_string());
-                    ui.label(fmt_bytes(e.bytes));
-                    ui.end_row();
-                }
+        let n = self.history.len();
+        list_table(ui, &[150.0, 320.0, 130.0, 220.0, 120.0]).header(28.0, |mut h| head(&mut h, &["When", "Program", "Version", "Publisher", "Items removed", "Freed"])).body(|body| {
+            body.rows(26.0, n, |mut row| {
+                let e = &self.history[n - 1 - row.index()];
+                row.col(|ui| cell(ui, e.when.as_str()));
+                row.col(|ui| cell(ui, e.name.as_str()));
+                row.col(|ui| cell(ui, e.version.as_str()));
+                row.col(|ui| cell(ui, e.publisher.as_str()));
+                row.col(|ui| cell(ui, e.items.to_string()));
+                row.col(|ui| cell(ui, bytes_or_zero(e.bytes)));
             });
         });
         if clear {
@@ -895,9 +1026,22 @@ impl App {
             }
         }
     }
+
+    fn settings(&self) -> settings::Settings {
+        settings::Settings {
+            window: self.window,
+            col_w: self.col_w,
+            sort: (Col::ALL.iter().position(|c| c.0 == self.sort.0).unwrap_or(0), self.sort.1),
+            tab: Tab::ALL.iter().position(|t| t.0 == self.tab).unwrap_or(0),
+        }
+    }
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = settings::save(&self.settings());
+    }
+
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         // egui's default text is grey; Geek's is plain white (black in light mode)
         ctx.style_mut(|s| {
@@ -970,10 +1114,27 @@ impl eframe::App for App {
             self.job(ctx, || Msg::Store(store_list()));
         }
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for (t, l) in [(Tab::Programs, "Programs"), (Tab::Store, "Store apps"), (Tab::Startup, "Startup"), (Tab::Monitor, "Install monitor"), (Tab::History, "History")] {
-                    if ui.selectable_label(self.tab == t, l).clicked() {
+        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+            self.window = [r.width(), r.height()];
+        }
+
+        // Tabs: plain text, the current one Semibold with an underline in the selection colour.
+        let bar = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(14.0, 0.0));
+        egui::TopBottomPanel::top("tabs").frame(bar).exact_height(40.0).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 26.0;
+                for (t, l) in Tab::ALL {
+                    let active = self.tab == t;
+                    let text = if active { theme::semibold(l) } else { egui::RichText::new(l).color(ui.visuals().weak_text_color()) };
+                    let r = ui.add(egui::Label::new(text.size(14.5)).selectable(false).sense(egui::Sense::click()));
+                    if active {
+                        let y = ui.max_rect().bottom() - 1.0;
+                        ui.painter().hline(r.rect.x_range(), y, egui::Stroke::new(2.0_f32, ui.visuals().hyperlink_color));
+                    }
+                    if r.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if r.clicked() {
                         self.tab = t;
                         self.confirm = None;
                     }
@@ -983,12 +1144,18 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let total: u64 = self.programs.iter().map(|p| self.size_of(p)).sum();
-                ui.label(format!("{} programs of {} size in total", self.programs.len(), fmt_bytes(total)));
-                ui.separator();
-                if self.busy > 0 {
-                    ui.spinner();
-                }
-                ui.label(&self.status);
+                ui.label(format!("{} programs, {} in total", self.programs.len(), fmt_bytes(total)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let measured = self.loading.iter().filter(|id| self.sizes.contains_key(*id)).count();
+                    let activity = if !self.status.is_empty() {
+                        self.status.clone()
+                    } else if measured < self.loading.len() {
+                        format!("Measuring sizes {measured} of {}", self.loading.len())
+                    } else {
+                        String::new()
+                    };
+                    ui.label(egui::RichText::new(activity).color(ui.visuals().weak_text_color()));
+                });
             });
         });
         self.dialogs(ctx);
@@ -1011,7 +1178,7 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1220.0, 780.0]).with_min_inner_size([640.0, 400.0]).with_drag_and_drop(true),
+        viewport: egui::ViewportBuilder::default().with_inner_size(settings::load().window).with_min_inner_size([640.0, 400.0]).with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native("Evict", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
