@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -102,11 +102,27 @@ impl Program {
         PathBuf::from(self.location.trim().trim_matches('"'))
     }
 
-    /// For when DisplayIcon is empty or stale (MSI installs, moved games): an exe in the install
-    /// folder, one named after the program, else the shallowest non-uninstaller.
-    pub fn icon_exe(&self, all: &[Program]) -> Option<String> {
+    /// Icon sources for when DisplayIcon is empty or stale, in Geek Uninstaller's order: the MSI
+    /// product icon, an exe in the install folder, a Start Menu shortcut with the program's name,
+    /// then a generic one.
+    pub fn icon_fallbacks(&self, all: &[Program]) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(packed) = msi_packed(self.key.trim_matches(['{', '}'])) {
+            for (hive, key) in [(Hive::LM, r"SOFTWARE\Classes\Installer\Products"), (Hive::CU, r"Software\Microsoft\Installer\Products")] {
+                v.extend(hive.root().open_subkey(format!(r"{key}\{packed}")).and_then(|k| k.get_value::<String, _>("ProductIcon")));
+            }
+        }
+        v.extend(self.icon_exe(all));
+        v.extend(start_menu().get(&lower_name(&self.name)).map(|p| p.display().to_string()));
+        // runtimes and language packs ship no icon at all: the generic application one, as in Geek
+        v.extend(env::var("SystemRoot").map(|r| format!(r"{r}\System32\shell32.dll,2")));
+        v
+    }
+
+    /// An exe in the install folder: one named after the program, else the shallowest non-uninstaller.
+    fn icon_exe(&self, all: &[Program]) -> Option<String> {
         let dir = self.install_dir(all, false)?;
-        let want: String = core_name(&self.name).chars().filter(|c| c.is_alphanumeric()).collect();
+        let want = lower_name(&self.name);
         let (mut level, mut named, mut first) = (vec![dir], None, None);
         // ponytail: 4 levels, 300 folders; deep enough for Epic's Launcher\Portal\Binaries\Win64
         for _ in 0..5 {
@@ -119,8 +135,7 @@ impl Program {
                     if p.is_dir() && !n.starts_with('_') {
                         next.push(p);
                     } else if n.ends_with(".exe") && !helper && named.is_none() {
-                        let stem: String = n[..n.len() - 4].chars().filter(|c| c.is_alphanumeric()).collect();
-                        if stem == want {
+                        if lower_name(&n[..n.len() - 4]) == want {
                             named = Some(p);
                         } else if first.is_none() {
                             first = Some(p);
@@ -522,6 +537,20 @@ pub fn desktop() -> PathBuf {
     let shell = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders";
     Hive::CU.root().open_subkey(shell).and_then(|k| k.get_value::<String, _>("Desktop")).map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default()).join("Desktop")
+    })
+}
+
+/// Core name without spaces or punctuation, lowercase: "Epic Games Launcher" → "epicgameslauncher".
+fn lower_name(s: &str) -> String {
+    core_name(s).chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// Start Menu shortcuts by `lower_name` of their file name, read once.
+fn start_menu() -> &'static HashMap<String, PathBuf> {
+    static M: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+    M.get_or_init(|| {
+        let dirs = ["APPDATA", "ProgramData"].into_iter().filter_map(env::var_os).map(|p| PathBuf::from(p).join(r"Microsoft\Windows\Start Menu\Programs"));
+        dirs.flat_map(|d| shortcuts(&d, 2)).filter_map(|f| Some((lower_name(&f.file_stem()?.to_string_lossy()), f))).collect()
     })
 }
 

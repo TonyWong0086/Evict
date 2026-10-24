@@ -118,6 +118,8 @@ struct App {
     window: [f32; 2],
     folders: HashMap<String, String>,
     col_w: [f32; 5],
+    /// minimum window width last sent to the OS
+    min_w: f32,
     icons: HashMap<String, egui::TextureHandle>,
     loading: HashSet<String>,
     store: Vec<StoreApp>,
@@ -299,6 +301,7 @@ impl App {
             window: st.window,
             folders: HashMap::new(),
             col_w: st.col_w,
+            min_w: 0.0,
             icons: HashMap::new(),
             loading: HashSet::new(),
             store: Vec::new(),
@@ -334,7 +337,7 @@ impl App {
         let (tx, c, all, icons) = (self.tx.clone(), ctx.clone(), self.programs.clone(), todo.clone());
         thread::spawn(move || {
             for p in icons {
-                if let Some(img) = win::icon(&p.icon).or_else(|| win::icon(&p.icon_exe(&all)?)) {
+                if let Some(img) = win::icon(&p.icon).or_else(|| p.icon_fallbacks(&all).iter().find_map(|s| win::icon(s))) {
                     let id = p.id();
                     let _ = tx.send(Msg::Icon(id, img));
                     c.request_repaint();
@@ -1048,6 +1051,17 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // Narrowest window that still shows a 53-character folder after the other columns.
+        let font = egui::TextStyle::Body.resolve(&ctx.style());
+        let loc = ctx.fonts(|f| f.layout_no_wrap("X".repeat(53), font, egui::Color32::WHITE).size().x);
+        let mut w = (self.col_w.iter().sum::<f32>() + loc + 6.0 * ctx.style().spacing.item_spacing.x + 40.0).round();
+        if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
+            w = w.min(m.x);
+        }
+        if w != self.min_w {
+            self.min_w = w;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(w, 400.0)));
+        }
         // egui's default text is grey; Geek's is plain white (black in light mode)
         ctx.style_mut(|s| {
             s.visuals.override_text_color = Some(if s.visuals.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK })

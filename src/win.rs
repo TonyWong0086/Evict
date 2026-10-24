@@ -18,7 +18,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives},
     System::WindowsProgramming::DRIVE_FIXED,
     UI::{
-        Shell::{ExtractIconExW, ShellExecuteW},
+        Shell::{ExtractIconExW, SHGetFileInfoW, ShellExecuteW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON},
         WindowsAndMessaging::*,
     },
 };
@@ -105,11 +105,21 @@ pub fn icon(display_icon: &str) -> Option<ColorImage> {
         Some((p, i)) if i.trim().parse::<i32>().is_ok() => (p, i.trim().parse().unwrap()),
         _ => (s, 0),
     };
-    let path = wide(path.trim().trim_matches('"'));
+    let path = path.trim().trim_matches('"');
+    // the shell fallback below would hand back a folder icon for "" or a directory
+    if !std::path::Path::new(path).is_file() {
+        return None;
+    }
+    let path = wide(path);
     unsafe {
         let mut h: HICON = null_mut();
         if ExtractIconExW(path.as_ptr(), index, &mut h, null_mut(), 1) == 0 || h.is_null() {
-            return None;
+            // Shortcuts and files without embedded icons: ask the shell, like Explorer does.
+            let mut fi: SHFILEINFOW = zeroed();
+            if SHGetFileInfoW(path.as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON) == 0 || fi.hIcon.is_null() {
+                return None;
+            }
+            h = fi.hIcon;
         }
         let img = to_rgba(h);
         DestroyIcon(h);
