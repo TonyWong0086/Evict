@@ -12,6 +12,7 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
     System::{
         SystemInformation::GetLocalTime,
+        Time::{FileTimeToSystemTime, SystemTimeToFileTime},
         JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation, QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION},
         Threading::{CreateProcessW, ResumeThread, Sleep, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW},
     },
@@ -84,6 +85,22 @@ pub fn now() -> String {
         t
     };
     format!("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
+}
+
+/// Local date `days` ago as "2026-10-18".
+pub fn days_ago(days: u64) -> String {
+    let t = unsafe {
+        let (mut t, mut ft) = (zeroed(), zeroed());
+        GetLocalTime(&mut t);
+        SystemTimeToFileTime(&t, &mut ft);
+        // FILETIME counts 100 ns ticks
+        let v = ((ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64) - days * 86_400 * 10_000_000;
+        ft.dwHighDateTime = (v >> 32) as u32;
+        ft.dwLowDateTime = v as u32;
+        FileTimeToSystemTime(&ft, &mut t);
+        t
+    };
+    format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay)
 }
 
 /// Open Explorer with `path` selected.

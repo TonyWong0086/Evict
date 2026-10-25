@@ -120,6 +120,8 @@ struct App {
     col_w: [f32; 5],
     /// minimum window width last sent to the OS
     min_w: f32,
+    /// install dates from this one on get a "new" tag
+    new_since: String,
     icons: HashMap<String, egui::TextureHandle>,
     loading: HashSet<String>,
     store: Vec<StoreApp>,
@@ -302,6 +304,7 @@ impl App {
             folders: HashMap::new(),
             col_w: st.col_w,
             min_w: 0.0,
+            new_since: win::days_ago(7),
             icons: HashMap::new(),
             loading: HashSet::new(),
             store: Vec::new(),
@@ -707,6 +710,9 @@ impl App {
                                 None => ui.add_space(18.0),
                             }
                             cell(ui, p.name.as_str());
+                            if p.date >= self.new_since {
+                                cell(ui, egui::RichText::new("new").small());
+                            }
                             if p.ghost {
                                 cell(ui, egui::RichText::new("ghost").color(theme::AMBER).small());
                             }
@@ -1164,6 +1170,12 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let total: u64 = self.programs.iter().map(|p| self.size_of(p)).sum();
                 ui.label(format!("{} programs, {} in total", self.programs.len(), fmt_bytes(total)));
+                if !self.sel.is_empty() {
+                    let sizes: Vec<u64> = self.programs.iter().filter(|p| self.sel.contains(&p.id())).map(|p| self.size_of(p)).collect();
+                    let bytes = fmt_bytes(sizes.iter().sum());
+                    ui.separator();
+                    ui.label(format!("{} selected{}", sizes.len(), if bytes.is_empty() { String::new() } else { format!(", {bytes}") }));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let measured = self.loading.iter().filter(|id| self.sizes.contains_key(*id)).count();
                     let activity = if !self.status.is_empty() {
